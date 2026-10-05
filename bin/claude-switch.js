@@ -116,14 +116,29 @@ function cmdCurrent() {
   console.log(`Global:   ${label(g)} ${c.dim(globalRaw || '(CLAUDE_CONFIG_DIR não definida → ~/.claude)')}`);
 }
 
+// Mensagens via stderr: com o wrapper, o stdout do "add" é avaliado pelo shell (troca de conta).
 function cmdAdd(pos, flags) {
   const acc = accounts.add(pos[0], flags.dir);
-  console.log(`${c.green('✔')} Conta ${c.bold(acc.name)} criada em ${c.dim(acc.dir)}`);
+  info(`${c.green('✔')} Conta ${c.bold(acc.name)} criada em ${c.dim(acc.dir)}`);
   if (!flags.isolated) {
     share.share(acc);
-    console.log(c.dim(`  histórico e sessões compartilhados com "${store.DEFAULT_NAME}" (use --isolated para não compartilhar)`));
+    info(c.dim(`  histórico e sessões compartilhados com "${store.DEFAULT_NAME}" (use --isolated para não compartilhar)`));
   }
-  console.log(`  Próximo passo: ${c.cyan(`csw use ${acc.name}`)} e depois ${c.cyan('claude')} → ${c.cyan('/login')}`);
+  if (flags['no-switch']) {
+    info(`  Próximo passo: ${c.cyan(`csw use ${acc.name}`)} e depois ${c.cyan('claude')} → ${c.cyan('/login')}`);
+    return;
+  }
+  // Troca para a conta nova para o login; a global só com --global, para novos terminais
+  // não abrirem numa conta ainda sem login.
+  if (flags.global) env.setGlobal(acc.dir);
+  if (applySession(flags, acc.dir)) {
+    info(`${c.green('✔')} Usando ${c.bold(acc.name)} ${c.dim(flags.global ? '(global + este terminal)' : '(apenas neste terminal)')}`);
+    const next = flags.global ? '' : ` Depois: ${c.cyan(`csw use ${acc.name}`)} para torná-la global.`;
+    info(`  Agora rode ${c.cyan('claude')} e faça o ${c.cyan('/login')}.${next}`);
+  } else {
+    warnNoWrapper();
+    info(`  Próximo passo: ${c.cyan(`csw use ${acc.name}`)} e depois ${c.cyan('claude')} → ${c.cyan('/login')}`);
+  }
 }
 
 function cmdUse(pos, flags, sessionOnly) {
@@ -402,8 +417,9 @@ ${c.bold('Uso:')} csw <comando> [args]
 
   ${c.cyan('list')}, ls                        lista as contas (* = este terminal)
   ${c.cyan('current')}                         conta deste terminal e conta global
-  ${c.cyan('add')} <conta> [--dir <pasta>] [--isolated]
-                                  cria uma conta (pasta padrão: ~/.claude-accounts/<conta>)
+  ${c.cyan('add')} <conta> [--dir <pasta>] [--isolated] [--global|--no-switch]
+                                  cria a conta (pasta padrão: ~/.claude-accounts/<conta>) e já
+                                  troca para ela neste terminal, para fazer o /login
   ${c.cyan('use')} <conta>                     troca a conta GLOBAL (novos terminais) e a deste terminal
   ${c.cyan('use')} <conta> --session           troca só neste terminal (atalho: ${c.cyan('csw shell <conta>')})
   ${c.cyan('rename')} <atual> <novo>           renomeia a conta

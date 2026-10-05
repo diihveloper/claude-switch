@@ -64,9 +64,9 @@ rm -rf ~/.claude-switch-app           # remove o app (suas contas em ~/.claude-a
 ## Uso
 
 ```text
-csw add trabalho              # cria ~/.claude-accounts/trabalho
-csw use trabalho              # GLOBAL: novos terminais + este terminal
+csw add trabalho              # cria ~/.claude-accounts/trabalho e já troca para ela NESTE terminal
 claude                        # → /login com a conta de trabalho
+csw use trabalho              # GLOBAL: novos terminais + este terminal
 
 csw use pessoal --session     # só neste terminal (atalho: csw shell pessoal)
 csw run trabalho claude       # executa um comando com outra conta, sem trocar

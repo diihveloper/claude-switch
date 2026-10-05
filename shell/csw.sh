@@ -11,7 +11,7 @@ unset _csw_src
 
 csw() {
   case "$1" in
-    use|shell|rename|mv|remove|rm)
+    add|create|use|shell|rename|mv|remove|rm)
       local out rc
       out="$(node "$_CSW_CORE" "$@" --emit bash)"
       rc=$?

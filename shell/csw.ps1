@@ -4,7 +4,7 @@
 $global:CswCore = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'bin') 'claude-switch.js'
 
 function csw {
-    if ($args.Count -gt 0 -and @('use', 'shell', 'rename', 'mv', 'remove', 'rm') -contains $args[0]) {
+    if ($args.Count -gt 0 -and @('add', 'create', 'use', 'shell', 'rename', 'mv', 'remove', 'rm') -contains $args[0]) {
         $out = & node $global:CswCore @args --emit pwsh
         $code = $LASTEXITCODE
         if ($code -eq 0 -and $out) { ($out -join "`n") | Invoke-Expression }
