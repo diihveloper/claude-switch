@@ -263,25 +263,54 @@ function targets() {
 
 const BLOCK_RE = new RegExp(`\\r?\\n?${MARK_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${MARK_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\r?\\n?`);
 
+// Reescreve no lugar: no Windows, writeFileSync falha com EPERM em arquivos ocultos (ex.: ~/.zshrc).
+function writeInPlace(file, content) {
+  if (!fs.existsSync(file)) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+    return;
+  }
+  const fd = fs.openSync(file, 'r+');
+  try {
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, content, 0, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Aplica a ação em cada profile; um arquivo com problema não impede os demais.
+function eachTarget(action) {
+  let failed = false;
+  for (const target of targets()) {
+    try {
+      action(target);
+    } catch (err) {
+      failed = true;
+      info(`${c.red('✖')} ${target.file}: ${err.message}`);
+    }
+  }
+  if (failed) process.exitCode = 1;
+}
+
 function cmdInstall() {
-  for (const { file, block } of targets()) {
+  eachTarget(({ file, block }) => {
     const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
     const stripped = current.replace(BLOCK_RE, '\n').replace(/\n+$/, '');
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, (stripped ? stripped + '\n\n' : '') + block + '\n');
+    writeInPlace(file, (stripped ? stripped + '\n\n' : '') + block + '\n');
     console.log(`${c.green('✔')} ${file}`);
-  }
+  });
   console.log(`\nAbra um novo terminal (ou recarregue o profile) e use ${c.cyan('csw help')}.`);
 }
 
 function cmdUninstall() {
-  for (const { file } of targets()) {
-    if (!fs.existsSync(file)) continue;
+  eachTarget(({ file }) => {
+    if (!fs.existsSync(file)) return;
     const current = fs.readFileSync(file, 'utf8');
-    if (!BLOCK_RE.test(current)) continue;
-    fs.writeFileSync(file, current.replace(BLOCK_RE, '\n').replace(/\n+$/, '') + '\n');
+    if (!BLOCK_RE.test(current)) return;
+    writeInPlace(file, current.replace(BLOCK_RE, '\n').replace(/\n+$/, '') + '\n');
     console.log(`${c.green('✔')} removido de ${file}`);
-  }
+  });
 }
 
 // ---------------------------------------------------------------- main
