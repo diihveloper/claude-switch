@@ -95,6 +95,8 @@ function remove(name, { deleteFiles }) {
   store.save(data);
   let deleted = false;
   if (deleteFiles && fs.existsSync(acc.dir)) {
+    // Desfaz os links antes de apagar, para nunca tocar no histórico compartilhado da base.
+    require('./share').unshare(acc);
     fs.rmSync(acc.dir, { recursive: true, force: true });
     deleted = true;
   }

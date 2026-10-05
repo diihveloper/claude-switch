@@ -7,10 +7,13 @@ const store = require('../src/store');
 const env = require('../src/env');
 const accounts = require('../src/accounts');
 const usage = require('../src/usage');
+const share = require('../src/share');
+const status = require('../src/status');
+const tray = require('../src/tray');
 const { c, table, bar, info } = require('../src/format');
 
 const ROOT = path.resolve(__dirname, '..');
-const VALUE_FLAGS = new Set(['dir', 'emit']);
+const VALUE_FLAGS = new Set(['dir', 'emit', 'interval', 'max-age']);
 
 function parseArgs(argv) {
   const pos = [];
@@ -74,10 +77,17 @@ function label(acc) {
 
 // ---------------------------------------------------------------- comandos
 
+const HISTORY_LABEL = {
+  base: c.cyan('base'),
+  shared: c.green('compartilhado'),
+  isolated: c.dim('isolado'),
+  partial: c.yellow('parcial (rode csw share)'),
+};
+
 function cmdList() {
   const sessionAcc = accounts.byEnvValue(env.getSession());
   const globalAcc = accounts.byEnvValue(env.getGlobal());
-  const rows = [[c.dim(' '), c.dim('CONTA'), c.dim('E-MAIL'), c.dim('PLANO'), c.dim('PASTA')]];
+  const rows = [[c.dim(' '), c.dim('CONTA'), c.dim('E-MAIL'), c.dim('PLANO'), c.dim('HISTÓRICO'), c.dim('PASTA')]];
   for (const acc of accounts.all()) {
     const d = accounts.details(acc);
     const active = sessionAcc && sessionAcc.name === acc.name;
@@ -88,6 +98,7 @@ function cmdList() {
       name,
       d.email || c.dim(d.loggedIn ? '?' : 'sem login'),
       d.plan || c.dim('-'),
+      HISTORY_LABEL[share.status(acc)],
       c.dim(acc.dir),
     ]);
   }
@@ -108,6 +119,10 @@ function cmdCurrent() {
 function cmdAdd(pos, flags) {
   const acc = accounts.add(pos[0], flags.dir);
   console.log(`${c.green('✔')} Conta ${c.bold(acc.name)} criada em ${c.dim(acc.dir)}`);
+  if (!flags.isolated) {
+    share.share(acc);
+    console.log(c.dim(`  histórico e sessões compartilhados com "${store.DEFAULT_NAME}" (use --isolated para não compartilhar)`));
+  }
   console.log(`  Próximo passo: ${c.cyan(`csw use ${acc.name}`)} e depois ${c.cyan('claude')} → ${c.cyan('/login')}`);
 }
 
@@ -115,6 +130,8 @@ function cmdUse(pos, flags, sessionOnly) {
   if (!pos[0]) throw new Error('Uso: csw use <conta> [--session]');
   const acc = accounts.get(pos[0]);
   const value = accounts.envValue(acc);
+  // A limpeza de histórico antigo do Claude recria o history.jsonl e desfaz o hardlink: refaz aqui.
+  if (share.status(acc) === 'partial') share.share(acc);
   if (!sessionOnly) env.setGlobal(value);
   const applied = applySession(flags, value);
   const scope = sessionOnly ? 'apenas neste terminal' : applied ? 'global + este terminal' : 'global (novos terminais)';
@@ -158,6 +175,69 @@ function cmdRemove(pos, flags) {
   if (sessionActive) {
     if (applySession(flags, null)) info(c.dim(`  este terminal voltou para "${store.DEFAULT_NAME}"`));
     else warnNoWrapper();
+  }
+}
+
+function shareTargets(pos, flags, usageText) {
+  if (flags.all) return accounts.all().filter((a) => !a.isDefault);
+  if (!pos[0]) throw new Error(usageText);
+  return [accounts.get(pos[0])];
+}
+
+function cmdShare(pos, flags) {
+  for (const acc of shareTargets(pos, flags, 'Uso: csw share <conta|--all>')) {
+    const changed = share.share(acc);
+    info(changed.length
+      ? `${c.green('✔')} ${c.bold(acc.name)}: histórico e sessões agora compartilhados ${c.dim('(' + changed.join(', ') + ')')}`
+      : `${c.green('✔')} ${c.bold(acc.name)}: já estava compartilhado`);
+  }
+}
+
+function cmdUnshare(pos, flags) {
+  for (const acc of shareTargets(pos, flags, 'Uso: csw unshare <conta|--all> [--copy]')) {
+    const changed = share.unshare(acc, { copy: !!flags.copy });
+    if (!changed.length) info(`${c.dim('-')} ${c.bold(acc.name)}: não estava compartilhado`);
+    else info(`${c.green('✔')} ${c.bold(acc.name)}: histórico isolado ${c.dim(flags.copy ? '(com uma cópia do atual)' : '(começa vazio)')}`);
+  }
+}
+
+// Uso interno do ícone da bandeja.
+async function cmdStatus(flags) {
+  const st = await status.collect({ maxAge: Number(flags['max-age']) || 0 });
+  process.stdout.write(JSON.stringify(st) + '\n');
+}
+
+function cmdTray(pos, flags) {
+  const interval = Math.max(1, Number(flags.interval) || 5);
+  const sub = pos[0] || 'start';
+  switch (sub) {
+    case 'start': {
+      const { already } = tray.start({ interval });
+      console.log(already
+        ? `${c.dim('-')} O ícone já está rodando.`
+        : `${c.green('✔')} Ícone iniciado na bandeja ${c.dim(`(uso atualizado a cada ${interval} min)`)}`);
+      return;
+    }
+    case 'stop':
+      console.log(tray.stop() ? `${c.green('✔')} Ícone encerrado.` : `${c.dim('-')} O ícone não está rodando.`);
+      return;
+    case 'status': {
+      const pid = tray.runningPid();
+      console.log(`Ícone: ${pid ? c.green(`rodando (pid ${pid})`) : c.dim('parado')}`);
+      console.log(`Iniciar com o sistema: ${tray.autostartEnabled() ? c.green('sim') : c.dim('não')}`);
+      return;
+    }
+    case 'autostart': {
+      const on = pos[1] === 'on' ? true : pos[1] === 'off' ? false : null;
+      if (on === null) throw new Error('Uso: csw tray autostart on|off');
+      const file = tray.setAutostart(on, { interval });
+      console.log(`${c.green('✔')} Iniciar com o sistema: ${on ? 'sim' : 'não'} ${c.dim(file)}`);
+      return;
+    }
+    case 'run': // Linux: processo do ícone em primeiro plano (usado pelo start e pelo autostart)
+      return tray.runLinuxForeground(interval);
+    default:
+      throw new Error('Uso: csw tray [start|stop|status|autostart on|off] [--interval <min>]');
   }
 }
 
@@ -322,18 +402,24 @@ ${c.bold('Uso:')} csw <comando> [args]
 
   ${c.cyan('list')}, ls                        lista as contas (* = este terminal)
   ${c.cyan('current')}                         conta deste terminal e conta global
-  ${c.cyan('add')} <conta> [--dir <pasta>]     cria uma conta (pasta padrão: ~/.claude-accounts/<conta>)
+  ${c.cyan('add')} <conta> [--dir <pasta>] [--isolated]
+                                  cria uma conta (pasta padrão: ~/.claude-accounts/<conta>)
   ${c.cyan('use')} <conta>                     troca a conta GLOBAL (novos terminais) e a deste terminal
   ${c.cyan('use')} <conta> --session           troca só neste terminal (atalho: ${c.cyan('csw shell <conta>')})
   ${c.cyan('rename')} <atual> <novo>           renomeia a conta
   ${c.cyan('remove')} <conta> [-y] [--keep-files|--purge]
                                   remove a conta (apaga a pasta se foi criada pelo claude-switch)
+  ${c.cyan('share')} <conta|--all>             compartilha histórico e sessões com "default"
+  ${c.cyan('unshare')} <conta|--all> [--copy]   volta a ter histórico próprio (--copy leva uma cópia)
   ${c.cyan('path')} [conta]                    mostra a pasta da conta
   ${c.cyan('usage')} [conta|--all]             uso/limites da conta (como o /usage)
   ${c.cyan('run')} <conta> <comando...>        executa um comando com a conta sem trocar (ex.: csw run trabalho claude)
+  ${c.cyan('tray')} [stop|status]              ícone na bandeja com a conta global e o uso (Windows; Linux com yad)
+  ${c.cyan('tray autostart')} on|off          inicia o ícone junto com o sistema
   ${c.cyan('install')} / ${c.cyan('uninstall')}             instala/remove a função "csw" (PowerShell, bash, zsh)
 
-A conta "${store.DEFAULT_NAME}" é o ~/.claude original (CLAUDE_CONFIG_DIR não definida).
+A conta "${store.DEFAULT_NAME}" é o ~/.claude original (CLAUDE_CONFIG_DIR não definida) e guarda o
+histórico e as sessões compartilhados. Login e configurações ficam separados por conta.
 `;
 
 async function main() {
@@ -360,8 +446,16 @@ async function main() {
     case 'remove':
     case 'rm':
       return cmdRemove(pos, flags);
+    case 'share':
+      return cmdShare(pos, flags);
+    case 'unshare':
+      return cmdUnshare(pos, flags);
     case 'path':
       return cmdPath(pos);
+    case 'status':
+      return cmdStatus(flags);
+    case 'tray':
+      return cmdTray(pos, flags);
     case 'usage':
       return cmdUsage(pos, flags);
     case 'install':
