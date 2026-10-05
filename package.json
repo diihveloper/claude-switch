@@ -1,0 +1,24 @@
+{
+  "name": "claude-switch",
+  "version": "1.0.0",
+  "description": "Gerencia várias contas do Claude Code na mesma máquina trocando CLAUDE_CONFIG_DIR (estilo nvm).",
+  "bin": {
+    "claude-switch": "bin/claude-switch.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/diihveloper/claude-switch.git"
+  },
+  "homepage": "https://github.com/diihveloper/claude-switch#readme",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cli",
+    "accounts",
+    "switch"
+  ]
+}
