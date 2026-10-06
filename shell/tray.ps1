@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory = $true)] [string]$Core,
     [string]$Node = 'node',
-    [int]$Interval = 5
+    [int]$Interval = 5,
+    [int]$Threshold = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -128,6 +129,14 @@ $script:lastRun = [datetime]::MinValue
 $script:forceFull = $true
 $script:alerted = @{}
 $script:menuDirty = $false
+$script:balloonTarget = $null
+$script:actionJob = $null
+
+# Clicar na notificação de limite troca para a conta sugerida.
+$notify.add_BalloonTipClicked({
+        if ($script:balloonTarget) { $t = $script:balloonTarget; $script:balloonTarget = $null; Switch-Account $t }
+    })
+$notify.add_BalloonTipClosed({ $script:balloonTarget = $null })
 
 # Clique esquerdo também abre o menu.
 $notify.add_MouseUp({
@@ -140,15 +149,40 @@ $notify.add_MouseUp({
 
 function Show-Error([string]$msg) {
     Write-Log "erro: $msg"
+    $script:balloonTarget = $null
+$script:actionJob = $null
     $notify.ShowBalloonTip(5000, 'claude-switch', $msg, [System.Windows.Forms.ToolTipIcon]::Error)
 }
 
 function Switch-Account([string]$name) {
     try {
         Invoke-CoreSync @('use', $name) | Out-Null
+        $script:balloonTarget = $null
+$script:actionJob = $null
         $notify.ShowBalloonTip(3000, 'claude-switch', "Conta global: $name (vale para novos terminais)", [System.Windows.Forms.ToolTipIcon]::Info)
     } catch { Show-Error $_.Exception.Message }
     $script:lastRun = [datetime]::MinValue
+}
+
+# Renova os tokens expirados em segundo plano; o resultado aparece numa notificação.
+function Start-TokenRefresh {
+    if ($script:actionJob) { return }
+    $script:actionJob = Start-Core @('refresh')
+    $script:menuDirty = $true
+}
+
+function Complete-TokenRefresh {
+    $j = $script:actionJob
+    $script:actionJob = $null
+    $text = ($j.Out.Result + $j.Err.Result).Trim() -replace '\s*\r?\n\s*', "`n"
+    if (-not $text) { $text = 'Concluído.' }
+    if ($text.Length -gt 250) { $text = $text.Substring(0, 247) + '…' }
+    $script:balloonTarget = $null
+    $icon = if ($j.Process.ExitCode -eq 0) { [System.Windows.Forms.ToolTipIcon]::Info } else { [System.Windows.Forms.ToolTipIcon]::Warning }
+    $notify.ShowBalloonTip(8000, 'claude-switch · tokens', $text, $icon)
+    $script:forceFull = $true
+    $script:lastRun = [datetime]::MinValue
+    $script:menuDirty = $true
 }
 
 function Open-Claude($acc) {
@@ -188,21 +222,31 @@ function Build-Menu {
     } else {
         $title = Add-Item $menu ('Conta global: ' + $(if ($st.global) { $st.global } else { '(pasta não registrada)' })) $null
         $title.Enabled = $false
+        $best = if ($st.best -and $st.best -ne $st.global) { @($st.accounts | Where-Object { $_.name -eq $st.best }) | Select-Object -First 1 }
+        if ($best) {
+            $bi = Add-Item $menu ("Trocar para a de mais limite: {0}" -f $best.name) { Switch-Account $this.Tag.name } $best
+            $bi.ShortcutKeyDisplayString = Get-Summary $best
+            $bi.Font = New-Object System.Drawing.Font($bi.Font, [System.Drawing.FontStyle]::Bold)
+        }
         [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
         foreach ($acc in $st.accounts) {
             $item = Add-Item $menu $acc.name { Switch-Account $this.Tag.name } $acc
             $item.ShortcutKeyDisplayString = Get-Summary $acc
             $item.Checked = [bool]$acc.isGlobal
-            $item.ToolTipText = (@($acc.email, $acc.plan, "histórico: $($acc.history)") | Where-Object { $_ }) -join ' · '
+            $item.ToolTipText = (@($acc.email, $acc.plan, "histórico: $($acc.history)", "config: $($acc.config)") | Where-Object { $_ }) -join ' · '
         }
         [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
         $open = New-Object System.Windows.Forms.ToolStripMenuItem 'Abrir Claude com'
         foreach ($acc in $st.accounts) { [void](Add-Item $open.DropDown $acc.name { Open-Claude $this.Tag } $acc) }
         [void]$menu.Items.Add($open)
     }
+    $expired = @($st.accounts | Where-Object { $_.tokenExpired }).Count
+    $refreshText = if ($script:actionJob) { 'Renovando tokens…' } elseif ($expired) { "Renovar tokens expirados ($expired)" } else { 'Renovar tokens expirados (nenhum)' }
+    $ri = Add-Item $menu $refreshText { Start-TokenRefresh }
+    $ri.Enabled = [bool]$expired -and -not $script:actionJob
     [void](Add-Item $menu 'Atualizar uso agora' { $script:forceFull = $true; $script:lastRun = [datetime]::MinValue })
     $auto = Add-Item $menu 'Iniciar com o Windows' {
-        try { Invoke-CoreSync @('tray', 'autostart', $(if ($this.Checked) { 'off' } else { 'on' }), '--interval', "$Interval") | Out-Null }
+        try { Invoke-CoreSync @('tray', 'autostart', $(if ($this.Checked) { 'off' } else { 'on' }), '--interval', "$Interval", '--threshold', "$Threshold") | Out-Null }
         catch { Show-Error $_.Exception.Message }
         $script:menuDirty = $true
     }
@@ -227,12 +271,22 @@ function Update-Tray {
         $tip = "Claude · $($g.name)`n" + (Get-Summary $g) + (Format-Reset $g 'five_hour')
         $notify.Text = if ($tip.Length -gt 63) { $tip.Substring(0, 63) } else { $tip }
 
-        # Aviso único ao cruzar 90% numa janela de uso.
+        # Aviso único por janela de uso ao cruzar o limite, sugerindo a conta com mais limite.
+        $best = if ($st.best -and $st.best -ne $g.name) { @($st.accounts | Where-Object { $_.name -eq $st.best }) | Select-Object -First 1 }
         foreach ($w in @($g.usage.windows | Where-Object { $_ })) {
             $key = "$($g.name)/$($w.key)/$($w.resetsAt)"
-            if ($w.pct -ge 90 -and -not $script:alerted[$key]) {
+            if ($w.pct -ge $Threshold -and -not $script:alerted[$key]) {
                 $script:alerted[$key] = $true
-                $notify.ShowBalloonTip(8000, "Claude · $($g.name)", ("{0}: {1}% usado{2}" -f $w.label, [math]::Round($w.pct), (Format-Reset $g $w.key)), [System.Windows.Forms.ToolTipIcon]::Warning)
+                $title = "Claude · $($g.name): {0} em {1}%" -f $w.label, [math]::Round($w.pct)
+                if ($best) {
+                    $script:balloonTarget = $best.name
+                    $body = "Clique para trocar para $($best.name) ($(Get-Summary $best))"
+                } else {
+                    $script:balloonTarget = $null
+$script:actionJob = $null
+                    $body = 'Nenhuma outra conta com limite disponível' + (Format-Reset $g $w.key)
+                }
+                $notify.ShowBalloonTip(15000, $title, $body, [System.Windows.Forms.ToolTipIcon]::Warning)
             }
         }
     }
@@ -246,6 +300,7 @@ $timer.Interval = 1000
 $timer.add_Tick({
         try {
             if ($stopEvent.WaitOne(0)) { Exit-Tray; return }
+            if ($script:actionJob -and $script:actionJob.Process.HasExited) { Complete-TokenRefresh }
             if ($script:menuDirty -and -not $menu.Visible) { $script:menuDirty = $false; Build-Menu }
             if ($script:job) {
                 if (-not $script:job.Process.HasExited) { return }

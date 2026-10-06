@@ -128,6 +128,7 @@ function details(acc) {
     org: state?.oauthAccount?.organizationName || null,
     plan: creds?.subscriptionType || null,
     loggedIn: !!creds?.accessToken,
+    tokenExpired: !!creds?.accessToken && !!creds.expiresAt && creds.expiresAt < Date.now(),
   };
 }
 

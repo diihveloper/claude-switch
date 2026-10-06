@@ -1,6 +1,6 @@
 {
   "name": "claude-switch",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Gerencia várias contas do Claude Code na mesma máquina trocando CLAUDE_CONFIG_DIR (estilo nvm).",
   "bin": {
     "claude-switch": "bin/claude-switch.js"

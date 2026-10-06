@@ -10,10 +10,14 @@ const usage = require('../src/usage');
 const share = require('../src/share');
 const status = require('../src/status');
 const tray = require('../src/tray');
+const project = require('../src/project');
+const install = require('../src/install');
+const statusline = require('../src/statusline');
+const doctor = require('../src/doctor');
+const refresh = require('../src/refresh');
 const { c, table, bar, info } = require('../src/format');
 
-const ROOT = path.resolve(__dirname, '..');
-const VALUE_FLAGS = new Set(['dir', 'emit', 'interval', 'max-age']);
+const VALUE_FLAGS = new Set(['dir', 'emit', 'interval', 'max-age', 'threshold']);
 
 function parseArgs(argv) {
   const pos = [];
@@ -39,8 +43,12 @@ function parseArgs(argv) {
 
 // Aplica a mudança no terminal atual via wrapper; sem wrapper só dá para avisar.
 function applySession(flags, value) {
+  return emitCode(flags, env.emit(flags.emit, value));
+}
+
+function emitCode(flags, code) {
   if (flags.emit === 'pwsh' || flags.emit === 'bash') {
-    process.stdout.write(env.emit(flags.emit, value) + '\n');
+    if (code) process.stdout.write(code + '\n');
     return true;
   }
   return false;
@@ -75,36 +83,69 @@ function label(acc) {
   return c.bold(acc.name);
 }
 
-// ---------------------------------------------------------------- comandos
+// Grupos de dados compartilhados escolhidos pelas flags --history/--config.
+function groupsFromFlags(flags, fallback) {
+  const chosen = share.GROUP_NAMES.filter((g) => flags[g]);
+  return chosen.length ? chosen : fallback;
+}
 
-const HISTORY_LABEL = {
+const GROUP_LABEL = { history: 'histórico e sessões', config: 'configurações' };
+
+// Refaz links desfeitos (ex.: a limpeza do Claude recria o history.jsonl) nos grupos já compartilhados.
+function healShares(acc) {
+  for (const group of share.GROUP_NAMES) {
+    if (share.status(acc, group) === 'partial') share.share(acc, { groups: [group] });
+  }
+}
+
+function summaryOf(entry) {
+  if (!entry) return 'sem dados';
+  if (entry.status) return entry.status.replace(/\s*\(.*\)$/, '');
+  const parts = [['five_hour', '5h'], ['seven_day', 'semana']]
+    .map(([k, l]) => {
+      const p = status.pctOf(entry, k);
+      return p == null ? null : `${l} ${Math.round(p)}%`;
+    })
+    .filter(Boolean);
+  return parts.join(' · ') || 'sem dados';
+}
+
+// ---------------------------------------------------------------- contas
+
+const SHARE_LABEL = {
   base: c.cyan('base'),
-  shared: c.green('compartilhado'),
-  isolated: c.dim('isolado'),
-  partial: c.yellow('parcial (rode csw share)'),
+  shared: c.green('sim'),
+  isolated: c.dim('não'),
+  partial: c.yellow('parcial'),
 };
 
 function cmdList() {
   const sessionAcc = accounts.byEnvValue(env.getSession());
   const globalAcc = accounts.byEnvValue(env.getGlobal());
-  const rows = [[c.dim(' '), c.dim('CONTA'), c.dim('E-MAIL'), c.dim('PLANO'), c.dim('HISTÓRICO'), c.dim('PASTA')]];
+  const rows = [[' ', 'CONTA', 'E-MAIL', 'PLANO', 'HISTÓRICO', 'CONFIG', 'PASTA'].map((h) => c.dim(h))];
+  let partial = false;
   for (const acc of accounts.all()) {
     const d = accounts.details(acc);
     const active = sessionAcc && sessionAcc.name === acc.name;
     const isGlobal = globalAcc && globalAcc.name === acc.name;
     const name = (active ? c.green(acc.name) : acc.name) + (isGlobal ? c.cyan(' (global)') : '');
+    const hist = share.status(acc, 'history');
+    const conf = share.status(acc, 'config');
+    partial ||= hist === 'partial' || conf === 'partial';
     rows.push([
       active ? c.green('*') : ' ',
       name,
       d.email || c.dim(d.loggedIn ? '?' : 'sem login'),
       d.plan || c.dim('-'),
-      HISTORY_LABEL[share.status(acc)],
+      SHARE_LABEL[hist],
+      SHARE_LABEL[conf],
       c.dim(acc.dir),
     ]);
   }
   console.log(table(rows));
   const raw = env.getSession();
   if (raw && !sessionAcc) console.log(c.yellow(`\n! CLAUDE_CONFIG_DIR aponta para uma pasta não registrada: ${raw}`));
+  if (partial) console.log(c.yellow('\n! Há links parciais: rode "csw doctor --fix".'));
 }
 
 function cmdCurrent() {
@@ -114,6 +155,8 @@ function cmdCurrent() {
   console.log(`Terminal: ${label(s)} ${c.dim(sessionRaw || '(CLAUDE_CONFIG_DIR não definida → ~/.claude)')}`);
   const g = accounts.byEnvValue(globalRaw);
   console.log(`Global:   ${label(g)} ${c.dim(globalRaw || '(CLAUDE_CONFIG_DIR não definida → ~/.claude)')}`);
+  const proj = project.find();
+  if (proj) console.log(`Projeto:  ${c.bold(proj.name)} ${c.dim(proj.file)}`);
 }
 
 // Mensagens via stderr: com o wrapper, o stdout do "add" é avaliado pelo shell (troca de conta).
@@ -121,8 +164,9 @@ function cmdAdd(pos, flags) {
   const acc = accounts.add(pos[0], flags.dir);
   info(`${c.green('✔')} Conta ${c.bold(acc.name)} criada em ${c.dim(acc.dir)}`);
   if (!flags.isolated) {
-    share.share(acc);
-    info(c.dim(`  histórico e sessões compartilhados com "${store.DEFAULT_NAME}" (use --isolated para não compartilhar)`));
+    const groups = flags['no-config'] ? ['history'] : ['history', 'config'];
+    share.share(acc, { groups });
+    info(c.dim(`  compartilhando com "${store.DEFAULT_NAME}": ${groups.map((g) => GROUP_LABEL[g]).join(' e ')} (--isolated para não compartilhar)`));
   }
   if (flags['no-switch']) {
     info(`  Próximo passo: ${c.cyan(`csw use ${acc.name}`)} e depois ${c.cyan('claude')} → ${c.cyan('/login')}`);
@@ -141,17 +185,47 @@ function cmdAdd(pos, flags) {
   }
 }
 
-function cmdUse(pos, flags, sessionOnly) {
-  if (!pos[0]) throw new Error('Uso: csw use <conta> [--session]');
-  const acc = accounts.get(pos[0]);
+function switchTo(acc, flags, { sessionOnly, reason = '' }) {
   const value = accounts.envValue(acc);
-  // A limpeza de histórico antigo do Claude recria o history.jsonl e desfaz o hardlink: refaz aqui.
-  if (share.status(acc) === 'partial') share.share(acc);
+  healShares(acc);
   if (!sessionOnly) env.setGlobal(value);
   const applied = applySession(flags, value);
+  if (flags.project) {
+    // Chamado pelo gancho de troca automática: uma linha discreta.
+    info(c.dim(`csw: conta ${acc.name}${reason}`));
+    return;
+  }
   const scope = sessionOnly ? 'apenas neste terminal' : applied ? 'global + este terminal' : 'global (novos terminais)';
-  info(`${c.green('✔')} Usando ${c.bold(acc.name)} ${c.dim(`(${scope})`)}`);
+  info(`${c.green('✔')} Usando ${c.bold(acc.name)} ${c.dim(`(${scope})`)}${reason}`);
   if (!applied) warnNoWrapper();
+}
+
+async function cmdUse(pos, flags, { sessionOnly = !!flags.session, auto = !!flags.auto } = {}) {
+  if (auto) return cmdNext(flags, sessionOnly);
+  if (pos[0]) return switchTo(accounts.get(pos[0]), flags, { sessionOnly });
+
+  // Sem argumento: conta do projeto (.claude-account), como o "nvm use" com .nvmrc.
+  const proj = project.find();
+  if (!proj) throw new Error('Uso: csw use <conta> [--session]   (ou crie um .claude-account com "csw pin <conta>")');
+  if (!proj.name) throw new Error(`${proj.file} está vazio.`);
+  // A conta do projeto vale só para este terminal, a menos que se peça --global.
+  switchTo(accounts.get(proj.name), flags, { sessionOnly: !flags.global, reason: c.dim(` — ${proj.file}`) });
+}
+
+// Escolhe a conta com mais limite disponível (5h e semanal).
+async function cmdNext(flags, sessionOnly = !!flags.session) {
+  const st = await status.collect({ maxAge: 120 });
+  const ranked = st.accounts.filter((a) => a.available != null).sort((a, b) => b.available - a.available);
+  if (!ranked.length) throw new Error('Nenhuma conta com uso consultável (sem login ou token expirado). Veja "csw doctor".');
+  for (const a of st.accounts) {
+    const mark = a.name === ranked[0].name ? c.green('→') : ' ';
+    const avail = a.available == null ? c.dim('—') : `${a.available}% livre`;
+    info(`  ${mark} ${a.name.padEnd(14)} ${avail.padEnd(10)} ${c.dim(summaryOf(a.usage))}`);
+  }
+  const current = accounts.byEnvValue(sessionOnly ? env.getSession() : env.getGlobal());
+  const best = accounts.get(ranked[0].name);
+  if (current && current.name === best.name) info(c.dim(`  "${best.name}" já é a conta com mais limite.`));
+  switchTo(best, flags, { sessionOnly });
 }
 
 function cmdRename(pos, flags) {
@@ -193,6 +267,14 @@ function cmdRemove(pos, flags) {
   }
 }
 
+function cmdPath(pos) {
+  const acc = pos[0] ? accounts.get(pos[0]) : accounts.byEnvValue(env.getSession());
+  if (!acc) throw new Error('CLAUDE_CONFIG_DIR aponta para uma pasta não registrada.');
+  console.log(acc.dir);
+}
+
+// ---------------------------------------------------------------- compartilhamento
+
 function shareTargets(pos, flags, usageText) {
   if (flags.all) return accounts.all().filter((a) => !a.isDefault);
   if (!pos[0]) throw new Error(usageText);
@@ -200,37 +282,166 @@ function shareTargets(pos, flags, usageText) {
 }
 
 function cmdShare(pos, flags) {
-  for (const acc of shareTargets(pos, flags, 'Uso: csw share <conta|--all>')) {
-    const changed = share.share(acc);
+  const groups = groupsFromFlags(flags, ['history']);
+  const what = groups.map((g) => GROUP_LABEL[g]).join(' e ');
+  for (const acc of shareTargets(pos, flags, 'Uso: csw share <conta|--all> [--history] [--config]')) {
+    const changed = share.share(acc, { groups });
     info(changed.length
-      ? `${c.green('✔')} ${c.bold(acc.name)}: histórico e sessões agora compartilhados ${c.dim('(' + changed.join(', ') + ')')}`
-      : `${c.green('✔')} ${c.bold(acc.name)}: já estava compartilhado`);
+      ? `${c.green('✔')} ${c.bold(acc.name)} agora compartilha: ${what} ${c.dim('(' + changed.join(', ') + ')')}`
+      : `${c.green('✔')} ${c.bold(acc.name)} já compartilhava: ${what}`);
+  }
+  if (groups.includes('config')) {
+    info(c.dim(`  Arquivos de configuração divergentes: vale o mais recente; o outro fica em ${path.join(store.STORE_DIR, 'backups')}`));
   }
 }
 
 function cmdUnshare(pos, flags) {
-  for (const acc of shareTargets(pos, flags, 'Uso: csw unshare <conta|--all> [--copy]')) {
-    const changed = share.unshare(acc, { copy: !!flags.copy });
-    if (!changed.length) info(`${c.dim('-')} ${c.bold(acc.name)}: não estava compartilhado`);
-    else info(`${c.green('✔')} ${c.bold(acc.name)}: histórico isolado ${c.dim(flags.copy ? '(com uma cópia do atual)' : '(começa vazio)')}`);
+  const groups = groupsFromFlags(flags, ['history']);
+  const what = groups.map((g) => GROUP_LABEL[g]).join(' e ');
+  for (const acc of shareTargets(pos, flags, 'Uso: csw unshare <conta|--all> [--history] [--config] [--copy]')) {
+    const changed = share.unshare(acc, { copy: !!flags.copy, groups });
+    if (!changed.length) info(`${c.dim('-')} ${c.bold(acc.name)} não compartilhava: ${what}`);
+    else info(`${c.green('✔')} ${c.bold(acc.name)} deixou de compartilhar: ${what} ${c.dim(flags.copy ? '(ficou com uma cópia do atual)' : '(começa vazio)')}`);
   }
 }
 
-// Uso interno do ícone da bandeja.
+// ---------------------------------------------------------------- projeto, auto, prompt
+
+function cmdPin(pos, flags) {
+  if (flags.remove) {
+    const file = project.unpin();
+    console.log(file ? `${c.green('✔')} Removido ${c.dim(file)}` : `${c.dim('-')} Não há ${project.FILE} nesta pasta.`);
+    return;
+  }
+  const acc = pos[0] ? accounts.get(pos[0]) : accounts.byEnvValue(env.getSession());
+  if (!acc) throw new Error('Informe a conta: csw pin <conta>');
+  const file = project.pin(acc.name);
+  console.log(`${c.green('✔')} ${c.dim(file)} → ${c.bold(acc.name)}`);
+  console.log(c.dim(`  "csw use" (sem argumento) aplica essa conta; com "csw auto on" a troca é automática ao entrar na pasta.`));
+}
+
+// Liga/desliga um recurso do wrapper: arquivo de marcação + chamada de shell para valer já neste terminal.
+function toggleFeature(pos, flags, { name, file, fn, onMsg, offMsg }) {
+  const flag = path.join(store.STORE_DIR, file);
+  const sub = pos[0] || 'status';
+  if (sub === 'status') {
+    info(`${name}: ${fs.existsSync(flag) ? c.green('ligado') : c.dim('desligado')}`);
+    return;
+  }
+  if (sub !== 'on' && sub !== 'off') throw new Error(`Uso: csw ${file === 'auto-cd' ? 'auto' : 'prompt'} on|off|status`);
+  const on = sub === 'on';
+  fs.mkdirSync(store.STORE_DIR, { recursive: true });
+  if (on) fs.writeFileSync(flag, '');
+  else fs.rmSync(flag, { force: true });
+  const code = flags.emit === 'pwsh' ? `__Csw${fn.pwsh}${on ? 'Enable' : 'Disable'}` : `_csw_${fn.bash}_${on ? 'enable' : 'disable'}`;
+  info(`${c.green('✔')} ${on ? onMsg : offMsg}`);
+  if (!emitCode(flags, code)) info(c.dim('  Vale para os próximos terminais.'));
+}
+
+function cmdAuto(pos, flags) {
+  toggleFeature(pos, flags, {
+    name: 'Troca automática ao entrar em projetos',
+    file: 'auto-cd',
+    fn: { pwsh: 'Auto', bash: 'auto' },
+    onMsg: `Troca automática ligada: ao entrar numa pasta com ${project.FILE}, o terminal muda para a conta dela.`,
+    offMsg: 'Troca automática desligada.',
+  });
+}
+
+function cmdPrompt(pos, flags) {
+  toggleFeature(pos, flags, {
+    name: 'Conta no prompt',
+    file: 'prompt',
+    fn: { pwsh: 'Prompt', bash: 'prompt' },
+    onMsg: 'Conta e % de 5h no prompt do terminal: ligado.',
+    offMsg: 'Conta no prompt: desligado.',
+  });
+}
+
+// ---------------------------------------------------------------- statusline, status, doctor
+
+function cmdStatusline(pos, flags) {
+  const sub = pos[0];
+  if (!sub) {
+    process.stdout.write(statusline.render() + '\n');
+    return;
+  }
+  if (sub === 'install') {
+    for (const { file, result } of statusline.install({ force: !!flags.force })) {
+      if (result === 'skipped') console.log(`${c.yellow('!')} ${file}: já tem outra statusLine (use --force para substituir)`);
+      else console.log(`${c.green('✔')} ${file}${result === 'already' ? c.dim(' (já instalada)') : ''}`);
+    }
+    console.log(c.dim('  Reinicie as sessões do Claude Code para ver a conta e o uso na barra de status.'));
+    return;
+  }
+  if (sub === 'uninstall') {
+    const files = statusline.uninstall();
+    console.log(files.length ? files.map((f) => `${c.green('✔')} removida de ${f}`).join('\n') : c.dim('- não estava instalada'));
+    return;
+  }
+  throw new Error('Uso: csw statusline [install [--force]|uninstall]');
+}
+
+// Renova tokens expirados (ou todos, com --force). Sem conta: todas as contas.
+async function cmdRefresh(pos, flags) {
+  const targets = pos[0] ? [accounts.get(pos[0])] : accounts.all();
+  const results = await Promise.all(targets.map((acc) => refresh.refreshAccount(acc, { force: !!flags.force })));
+  let renewed = 0;
+  let failed = 0;
+  targets.forEach((acc, i) => {
+    const r = results[i];
+    if (r.skipped) {
+      if (pos[0] || flags.verbose) console.log(`${c.dim('-')} ${acc.name}: ${c.dim(r.msg)}`);
+      return;
+    }
+    if (r.ok) renewed++;
+    else failed++;
+    console.log(`${r.ok ? c.green('✔') : c.red('✖')} ${acc.name}: ${r.msg}`);
+  });
+  if (!renewed && !failed) console.log(c.dim('Nenhum token expirado.'));
+  if (failed) process.exitCode = 1;
+}
+
+// Uso interno do ícone da bandeja e da statusline.
 async function cmdStatus(flags) {
   const st = await status.collect({ maxAge: Number(flags['max-age']) || 0 });
   process.stdout.write(JSON.stringify(st) + '\n');
 }
 
+async function cmdDoctor(flags) {
+  const results = doctor.run();
+  const icon = { ok: c.green('✔'), info: c.cyan('i'), warn: c.yellow('!'), error: c.red('✖') };
+  for (const r of results) console.log(`${icon[r.level]} ${r.msg}${r.fix && !flags.fix ? c.dim(`  (--fix: ${r.fix.label})`) : ''}`);
+  const fixable = results.filter((r) => r.fix);
+  if (flags.fix && fixable.length) {
+    console.log();
+    for (const r of fixable) {
+      try {
+        const out = await r.fix.run();
+        if (out && out.ok === false) throw new Error(out.msg);
+        console.log(`${c.green('✔')} corrigido: ${r.fix.label}`);
+      } catch (err) {
+        console.log(`${c.red('✖')} falhou (${r.fix.label}): ${err.message}`);
+      }
+    }
+  }
+  const problems = results.filter((r) => r.level === 'warn' || r.level === 'error').length;
+  console.log(problems ? c.yellow(`\n${problems} ponto(s) de atenção.`) : c.green('\nTudo certo.'));
+  if (results.some((r) => r.level === 'error') && !flags.fix) process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------- bandeja
+
 function cmdTray(pos, flags) {
   const interval = Math.max(1, Number(flags.interval) || 5);
+  const threshold = Math.min(100, Math.max(1, Number(flags.threshold) || 90));
   const sub = pos[0] || 'start';
   switch (sub) {
     case 'start': {
-      const { already } = tray.start({ interval });
+      const { already } = tray.start({ interval, threshold });
       console.log(already
         ? `${c.dim('-')} O ícone já está rodando.`
-        : `${c.green('✔')} Ícone iniciado na bandeja ${c.dim(`(uso atualizado a cada ${interval} min)`)}`);
+        : `${c.green('✔')} Ícone iniciado na bandeja ${c.dim(`(uso a cada ${interval} min, alerta em ${threshold}%)`)}`);
       return;
     }
     case 'stop':
@@ -245,22 +456,18 @@ function cmdTray(pos, flags) {
     case 'autostart': {
       const on = pos[1] === 'on' ? true : pos[1] === 'off' ? false : null;
       if (on === null) throw new Error('Uso: csw tray autostart on|off');
-      const file = tray.setAutostart(on, { interval });
+      const file = tray.setAutostart(on, { interval, threshold });
       console.log(`${c.green('✔')} Iniciar com o sistema: ${on ? 'sim' : 'não'} ${c.dim(file)}`);
       return;
     }
     case 'run': // Linux: processo do ícone em primeiro plano (usado pelo start e pelo autostart)
-      return tray.runLinuxForeground(interval);
+      return tray.runLinuxForeground({ interval, threshold });
     default:
-      throw new Error('Uso: csw tray [start|stop|status|autostart on|off] [--interval <min>]');
+      throw new Error('Uso: csw tray [start|stop|status|autostart on|off] [--interval <min>] [--threshold <%>]');
   }
 }
 
-function cmdPath(pos) {
-  const acc = pos[0] ? accounts.get(pos[0]) : accounts.byEnvValue(env.getSession());
-  if (!acc) throw new Error('CLAUDE_CONFIG_DIR aponta para uma pasta não registrada.');
-  console.log(acc.dir);
-}
+// ---------------------------------------------------------------- uso e run
 
 function fmtReset(d) {
   if (!d || isNaN(d)) return '';
@@ -322,62 +529,9 @@ function cmdRun(argv) {
 
 // ---------------------------------------------------------------- install
 
-const MARK_BEGIN = '# >>> claude-switch >>>';
-const MARK_END = '# <<< claude-switch <<<';
-
-function toPosix(p) {
-  return env.isWin ? p.replace(/^([A-Za-z]):/, (_, d) => '/' + d.toLowerCase()).replace(/\\/g, '/') : p;
-}
-
-function psProfiles() {
-  const found = new Set();
-  for (const exe of ['pwsh', 'powershell']) {
-    const r = spawnSync(exe, ['-NoProfile', '-NonInteractive', '-Command', '$PROFILE.CurrentUserCurrentHost'], {
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    const p = !r.error && r.status === 0 && r.stdout.trim();
-    if (p) found.add(p);
-  }
-  return [...found];
-}
-
-function targets() {
-  const ps1 = path.join(ROOT, 'shell', 'csw.ps1');
-  const sh = toPosix(path.join(ROOT, 'shell', 'csw.sh'));
-  const list = psProfiles().map((file) => ({
-    file,
-    block: `${MARK_BEGIN}\nif (Test-Path '${ps1}') { . '${ps1}' }\n${MARK_END}`,
-  }));
-  const shBlock = `${MARK_BEGIN}\n[ -f '${sh}' ] && . '${sh}'\n${MARK_END}`;
-  list.push({ file: path.join(store.HOME, '.bashrc'), block: shBlock });
-  const zshrc = path.join(store.HOME, '.zshrc');
-  if (fs.existsSync(zshrc) || /zsh$/.test(process.env.SHELL || '')) list.push({ file: zshrc, block: shBlock });
-  return list;
-}
-
-const BLOCK_RE = new RegExp(`\\r?\\n?${MARK_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${MARK_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\r?\\n?`);
-
-// Reescreve no lugar: no Windows, writeFileSync falha com EPERM em arquivos ocultos (ex.: ~/.zshrc).
-function writeInPlace(file, content) {
-  if (!fs.existsSync(file)) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, content);
-    return;
-  }
-  const fd = fs.openSync(file, 'r+');
-  try {
-    fs.ftruncateSync(fd, 0);
-    fs.writeSync(fd, content, 0, 'utf8');
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-// Aplica a ação em cada profile; um arquivo com problema não impede os demais.
 function eachTarget(action) {
   let failed = false;
-  for (const target of targets()) {
+  for (const target of install.targets()) {
     try {
       action(target);
     } catch (err) {
@@ -389,22 +543,16 @@ function eachTarget(action) {
 }
 
 function cmdInstall() {
-  eachTarget(({ file, block }) => {
-    const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-    const stripped = current.replace(BLOCK_RE, '\n').replace(/\n+$/, '');
-    writeInPlace(file, (stripped ? stripped + '\n\n' : '') + block + '\n');
-    console.log(`${c.green('✔')} ${file}`);
+  eachTarget((target) => {
+    install.installTarget(target);
+    console.log(`${c.green('✔')} ${target.file}`);
   });
   console.log(`\nAbra um novo terminal (ou recarregue o profile) e use ${c.cyan('csw help')}.`);
 }
 
 function cmdUninstall() {
-  eachTarget(({ file }) => {
-    if (!fs.existsSync(file)) return;
-    const current = fs.readFileSync(file, 'utf8');
-    if (!BLOCK_RE.test(current)) return;
-    writeInPlace(file, current.replace(BLOCK_RE, '\n').replace(/\n+$/, '') + '\n');
-    console.log(`${c.green('✔')} removido de ${file}`);
+  eachTarget((target) => {
+    if (install.uninstallTarget(target)) console.log(`${c.green('✔')} removido de ${target.file}`);
   });
 }
 
@@ -415,27 +563,45 @@ ${c.bold('claude-switch')} — várias contas do Claude Code na mesma máquina (
 
 ${c.bold('Uso:')} csw <comando> [args]
 
+${c.bold('Contas')}
   ${c.cyan('list')}, ls                        lista as contas (* = este terminal)
-  ${c.cyan('current')}                         conta deste terminal e conta global
-  ${c.cyan('add')} <conta> [--dir <pasta>] [--isolated] [--global|--no-switch]
-                                  cria a conta (pasta padrão: ~/.claude-accounts/<conta>) e já
-                                  troca para ela neste terminal, para fazer o /login
+  ${c.cyan('current')}                         conta deste terminal, global e do projeto
+  ${c.cyan('add')} <conta> [--dir <pasta>] [--isolated|--no-config] [--global|--no-switch]
+                                  cria a conta e já troca para ela neste terminal, para o /login
   ${c.cyan('use')} <conta>                     troca a conta GLOBAL (novos terminais) e a deste terminal
   ${c.cyan('use')} <conta> --session           troca só neste terminal (atalho: ${c.cyan('csw shell <conta>')})
+  ${c.cyan('use')}                             usa a conta do projeto (${project.FILE}), só neste terminal
+  ${c.cyan('next')} [--session]                troca para a conta com mais limite (= ${c.cyan('use --auto')})
   ${c.cyan('rename')} <atual> <novo>           renomeia a conta
   ${c.cyan('remove')} <conta> [-y] [--keep-files|--purge]
-                                  remove a conta (apaga a pasta se foi criada pelo claude-switch)
-  ${c.cyan('share')} <conta|--all>             compartilha histórico e sessões com "default"
-  ${c.cyan('unshare')} <conta|--all> [--copy]   volta a ter histórico próprio (--copy leva uma cópia)
   ${c.cyan('path')} [conta]                    mostra a pasta da conta
-  ${c.cyan('usage')} [conta|--all]             uso/limites da conta (como o /usage)
-  ${c.cyan('run')} <conta> <comando...>        executa um comando com a conta sem trocar (ex.: csw run trabalho claude)
-  ${c.cyan('tray')} [stop|status]              ícone na bandeja com a conta global e o uso (Windows; Linux com yad)
+  ${c.cyan('run')} <conta> <comando...>        executa um comando com a conta sem trocar
+
+${c.bold('Projetos')}
+  ${c.cyan('pin')} [conta] | --remove          grava/remove o ${project.FILE} da pasta atual
+  ${c.cyan('auto')} on|off|status              troca automática ao entrar em pastas com ${project.FILE}
+
+${c.bold('Compartilhamento')} (com a conta "${store.DEFAULT_NAME}")
+  ${c.cyan('share')} <conta|--all> [--history] [--config]
+                                  --history: histórico e sessões (padrão); --config: settings.json,
+                                  CLAUDE.md, skills, agents, commands e output-styles
+  ${c.cyan('unshare')} <conta|--all> [--history] [--config] [--copy]
+
+${c.bold('Uso e visibilidade')}
+  ${c.cyan('usage')} [conta|--all]             uso/limites (como o /usage)
+  ${c.cyan('refresh')} [conta] [--force]        renova tokens expirados (sem precisar abrir o Claude)
+  ${c.cyan('statusline')} install|uninstall    conta e uso na barra de status do Claude Code
+  ${c.cyan('prompt')} on|off|status            conta e uso no prompt do terminal
+  ${c.cyan('tray')} [stop|status] [--interval <min>] [--threshold <%>]
+                                  ícone na bandeja (Windows; Linux com yad)
   ${c.cyan('tray autostart')} on|off          inicia o ícone junto com o sistema
+
+${c.bold('Manutenção')}
+  ${c.cyan('doctor')} [--fix]                  diagnóstico (tokens, links, função csw, profiles)
   ${c.cyan('install')} / ${c.cyan('uninstall')}             instala/remove a função "csw" (PowerShell, bash, zsh)
 
-A conta "${store.DEFAULT_NAME}" é o ~/.claude original (CLAUDE_CONFIG_DIR não definida) e guarda o
-histórico e as sessões compartilhados. Login e configurações ficam separados por conta.
+A conta "${store.DEFAULT_NAME}" é o ~/.claude original (CLAUDE_CONFIG_DIR não definida) e guarda os dados
+compartilhados. Login, MCPs e plugins ficam sempre separados por conta.
 `;
 
 async function main() {
@@ -453,23 +619,39 @@ async function main() {
     case 'create':
       return cmdAdd(pos, flags);
     case 'use':
-      return cmdUse(pos, flags, !!flags.session);
+      return cmdUse(pos, flags);
     case 'shell':
-      return cmdUse(pos, flags, true);
+      return cmdUse(pos, flags, { sessionOnly: true });
+    case 'next':
+      return cmdNext(flags);
     case 'rename':
     case 'mv':
       return cmdRename(pos, flags);
     case 'remove':
     case 'rm':
       return cmdRemove(pos, flags);
+    case 'path':
+      return cmdPath(pos);
     case 'share':
       return cmdShare(pos, flags);
     case 'unshare':
       return cmdUnshare(pos, flags);
-    case 'path':
-      return cmdPath(pos);
+    case 'pin':
+      return cmdPin(pos, flags);
+    case 'unpin':
+      return cmdPin(pos, { ...flags, remove: true });
+    case 'auto':
+      return cmdAuto(pos, flags);
+    case 'prompt':
+      return cmdPrompt(pos, flags);
+    case 'statusline':
+      return cmdStatusline(pos, flags);
     case 'status':
       return cmdStatus(flags);
+    case 'doctor':
+      return cmdDoctor(flags);
+    case 'refresh':
+      return cmdRefresh(pos, flags);
     case 'tray':
       return cmdTray(pos, flags);
     case 'usage':

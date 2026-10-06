@@ -35,9 +35,9 @@ function runningPid() {
 
 const WIN_PS = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 
-function winArgs(interval) {
+function winArgs({ interval, threshold }) {
   return ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', TRAY_PS1,
-    '-Core', CORE, '-Node', process.execPath, '-Interval', String(interval)];
+    '-Core', CORE, '-Node', process.execPath, '-Interval', String(interval), '-Threshold', String(threshold)];
 }
 
 function runPowerShell(script, extraEnv = {}) {
@@ -147,7 +147,25 @@ function summary(acc) {
 const yadSafe = (s) => String(s).replace(/[!|\n]/g, ' ');
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
-function runLinuxForeground(interval) {
+function hasNotifySend() {
+  return !spawnSync('notify-send', ['--version'], { stdio: 'ignore' }).error;
+}
+
+// Notificação com botão "Trocar para X" (notify-send -A); sem suporte a ações, só o aviso.
+function notifySwitch(title, body, target, node, core) {
+  if (!hasNotifySend()) return;
+  const args = ['-a', 'claude-switch', '-u', 'critical', title, body];
+  if (!target) return void spawn('notify-send', args, { stdio: 'ignore' });
+  const n = spawn('notify-send', ['-A', 'switch=Trocar para ' + target, ...args], { stdio: ['ignore', 'pipe', 'ignore'] });
+  let out = '';
+  n.stdout.on('data', (d) => (out += d));
+  n.on('exit', (code) => {
+    if (code !== 0 && !out) return void spawn('notify-send', args, { stdio: 'ignore' }); // notify-send sem -A
+    if (out.trim() === 'switch') spawn(node, [core, 'use', target], { stdio: 'ignore' });
+  });
+}
+
+function runLinuxForeground({ interval, threshold }) {
   if (!hasYad()) throw new Error('Instale o "yad" para usar o ícone na bandeja (ex.: sudo apt install yad).');
   if (runningPid() && runningPid() !== process.pid) throw new Error('O ícone já está rodando.');
   fs.mkdirSync(store.STORE_DIR, { recursive: true });
@@ -164,6 +182,7 @@ function runLinuxForeground(interval) {
 
   let busy = false;
   let forceFull = true;
+  const alerted = new Set();
   async function refresh() {
     if (busy) return;
     busy = true;
@@ -173,12 +192,32 @@ function runLinuxForeground(interval) {
       const g = st.accounts.find((a) => a.isGlobal) || st.accounts[0];
       send(`icon:${icons[level(g)]}`);
       send(`tooltip:${yadSafe(`Claude · ${g.name}`)}\\n${yadSafe(summary(g))}`);
+      const best = st.best && st.best !== g.name ? st.accounts.find((a) => a.name === st.best) : null;
+
+      // Aviso único por janela de uso ao cruzar o limite, oferecendo a conta com mais limite.
+      for (const w of g.usage?.windows || []) {
+        const key = `${g.name}/${w.key}/${w.resetsAt}`;
+        if (w.pct < threshold || alerted.has(key)) continue;
+        alerted.add(key);
+        const body = best ? `Conta com mais limite: ${best.name} (${summary(best)})` : 'Nenhuma outra conta com limite disponível.';
+        notifySwitch(`Claude · ${g.name}: ${w.label} em ${Math.round(w.pct)}%`, body, best?.name, process.execPath, CORE);
+      }
+
       const items = st.accounts.map((a) => `${a.isGlobal ? '● ' : '○ '}${yadSafe(a.name)} — ${yadSafe(summary(a))}!${node} ${core} use ${a.name}`);
+      if (best) items.unshift(`Trocar para a de mais limite: ${yadSafe(best.name)}!${node} ${core} use ${best.name}`);
       if (terminal) {
         for (const a of st.accounts) {
           const envCmd = a.envValue ? `env CLAUDE_CONFIG_DIR=${shq(a.envValue)}` : 'env -u CLAUDE_CONFIG_DIR';
           items.push(`Abrir Claude: ${yadSafe(a.name)}!${shq(terminal)} -e ${envCmd} claude`);
         }
+      }
+      // Renova os tokens expirados e, ao terminar, pede uma nova leitura do uso (SIGUSR1).
+      const expired = st.accounts.filter((a) => a.tokenExpired).length;
+      if (expired) {
+        // Sem "|" nem "!": são separadores do menu do yad.
+        const notify = hasNotifySend() ? `; notify-send -a claude-switch 'claude-switch · tokens' "$out"` : '';
+        const script = `out=$(NO_COLOR=1 ${node} ${core} refresh 2>&1)${notify}; kill -USR1 ${process.pid}`;
+        items.push(`Renovar tokens expirados (${expired})!sh -c ${shq(script)}`);
       }
       items.push(`Atualizar uso agora!kill -USR1 ${process.pid}`);
       items.push(`Sair!kill ${process.pid}`);
@@ -213,21 +252,21 @@ function runLinuxForeground(interval) {
 
 // ---------------------------------------------------------------- comandos
 
-function start({ interval = 5 } = {}) {
+function start({ interval = 5, threshold = 90 } = {}) {
   assertSupported();
   if (runningPid()) return { already: true };
   if (isWin) {
     // Um spawn "detached" do Node cria o PowerShell sem console e ele encerra na hora;
     // o Start-Process cria o processo de forma independente e oculta.
     // O Windows PowerShell junta o -ArgumentList com espaços sem aspas: caminhos com espaço vão entre "".
-    const args = winArgs(interval)
+    const args = winArgs({ interval, threshold })
       .map((a) => (/\s/.test(a) ? `"${a}"` : a))
       .map((a) => `'${a.replace(/'/g, "''")}'`)
       .join(',');
     runPowerShell(`Start-Process -FilePath $env:CSW_PS -ArgumentList ${args} -WindowStyle Hidden`, { CSW_PS: WIN_PS });
   } else {
     if (!hasYad()) throw new Error('Instale o "yad" para usar o ícone na bandeja (ex.: sudo apt install yad).');
-    spawn(process.execPath, [CORE, 'tray', 'run', '--interval', String(interval)], { detached: true, stdio: 'ignore' }).unref();
+    spawn(process.execPath, [CORE, 'tray', 'run', '--interval', String(interval), '--threshold', String(threshold)], { detached: true, stdio: 'ignore' }).unref();
   }
   return { already: false };
 }
@@ -262,7 +301,7 @@ function autostartEnabled() {
   return fs.existsSync(autostartFile());
 }
 
-function setAutostart(enabled, { interval = 5 } = {}) {
+function setAutostart(enabled, { interval = 5, threshold = 90 } = {}) {
   assertSupported();
   const file = autostartFile();
   if (!enabled) {
@@ -270,7 +309,7 @@ function setAutostart(enabled, { interval = 5 } = {}) {
     return file;
   }
   if (isWin) {
-    const args = winArgs(interval).map((a) => (/[\s"]/.test(a) ? `"${a}"` : a)).join(' ');
+    const args = winArgs({ interval, threshold }).map((a) => (/[\s"]/.test(a) ? `"${a}"` : a)).join(' ');
     runPowerShell(
       `$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CSW_LNK); $s.TargetPath = $env:CSW_TARGET; ` +
         `$s.Arguments = $env:CSW_ARGS; $s.WindowStyle = 7; $s.Description = 'claude-switch tray'; $s.Save()`,
@@ -281,7 +320,7 @@ function setAutostart(enabled, { interval = 5 } = {}) {
     fs.writeFileSync(
       file,
       ['[Desktop Entry]', 'Type=Application', 'Name=claude-switch tray', 'Comment=Conta e uso do Claude Code',
-        `Exec="${process.execPath}" "${CORE}" tray run --interval ${interval}`, 'X-GNOME-Autostart-enabled=true', ''].join('\n')
+        `Exec="${process.execPath}" "${CORE}" tray run --interval ${interval} --threshold ${threshold}`, 'X-GNOME-Autostart-enabled=true', ''].join('\n')
     );
   }
   return file;

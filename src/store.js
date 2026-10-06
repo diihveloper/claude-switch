@@ -28,6 +28,8 @@ function save(data) {
   const tmp = STORE_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
   fs.renameSync(tmp, STORE_FILE);
+  // Mantém o arquivo do prompt do shell em dia com os nomes/pastas das contas.
+  require('./status').writePromptCache();
 }
 
 module.exports = { HOME, STORE_DIR, STORE_FILE, ACCOUNTS_DIR, DEFAULT_NAME, DEFAULT_DIR, load, save };

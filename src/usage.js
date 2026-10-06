@@ -16,7 +16,7 @@ async function fetchUsage(acc) {
   const creds = accounts.credentials(acc);
   if (!creds?.accessToken) return { status: 'sem credenciais (faça /login nessa conta)' };
   if (creds.expiresAt && creds.expiresAt < Date.now()) {
-    return { status: `token expirado (rode "csw run ${acc.name} claude" para renovar)` };
+    return { status: 'token expirado (rode "csw refresh" para renovar)' };
   }
   try {
     const res = await fetch(USAGE_URL, {
@@ -28,7 +28,7 @@ async function fetchUsage(acc) {
       },
       signal: AbortSignal.timeout(15000),
     });
-    if (res.status === 401) return { status: `token inválido (rode "csw run ${acc.name} claude" para renovar)` };
+    if (res.status === 401) return { status: 'token inválido (rode "csw refresh" para renovar)' };
     if (!res.ok) return { status: `erro HTTP ${res.status}` };
     return { data: await res.json() };
   } catch (err) {

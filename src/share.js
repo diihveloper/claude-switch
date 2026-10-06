@@ -1,7 +1,8 @@
 'use strict';
-// Compartilha histórico e sessões entre contas: os itens abaixo, dentro da pasta de cada conta,
-// viram links para os mesmos itens em ~/.claude (a conta "default", que funciona como base).
-// Credenciais (.credentials.json) e estado da conta (.claude.json) continuam separados.
+// Compartilha dados entre contas: os itens abaixo, dentro da pasta de cada conta, viram links
+// para os mesmos itens em ~/.claude (a conta "default", que funciona como base).
+// Dois grupos: "history" (histórico e sessões) e "config" (configurações do usuário).
+// Credenciais (.credentials.json), estado da conta (.claude.json), MCPs e plugins continuam separados.
 const fs = require('fs');
 const path = require('path');
 const store = require('./store');
@@ -9,15 +10,28 @@ const env = require('./env');
 
 const HUB = store.DEFAULT_DIR;
 
-const ITEMS = [
-  { name: 'projects', dir: true }, // transcrições das sessões (/resume, --continue)
-  { name: 'file-history', dir: true }, // checkpoints para /rewind
-  { name: 'paste-cache', dir: true }, // conteúdo colado referenciado pelo histórico
-  { name: 'plans', dir: true },
-  { name: 'todos', dir: true },
-  { name: 'session-env', dir: true },
-  { name: 'history.jsonl', dir: false }, // histórico de prompts (seta para cima)
-];
+const GROUPS = {
+  history: [
+    { name: 'projects', dir: true }, // transcrições das sessões (/resume, --continue)
+    { name: 'file-history', dir: true }, // checkpoints para /rewind
+    { name: 'paste-cache', dir: true }, // conteúdo colado referenciado pelo histórico
+    { name: 'plans', dir: true },
+    { name: 'todos', dir: true },
+    { name: 'session-env', dir: true },
+    { name: 'history.jsonl', dir: false, kind: 'log' }, // histórico de prompts (seta para cima)
+  ],
+  config: [
+    { name: 'settings.json', dir: false, kind: 'config', initial: '{}\n' },
+    { name: 'CLAUDE.md', dir: false, kind: 'config', initial: '' },
+    { name: 'skills', dir: true },
+    { name: 'agents', dir: true },
+    { name: 'commands', dir: true },
+    { name: 'output-styles', dir: true },
+  ],
+};
+const GROUP_NAMES = Object.keys(GROUPS);
+const ITEMS = GROUP_NAMES.flatMap((g) => GROUPS[g]);
+const itemsOf = (groups = GROUP_NAMES) => groups.flatMap((g) => GROUPS[g] || []);
 
 function lstat(p) {
   try {
@@ -40,7 +54,7 @@ function itemStatus(acc, item) {
       return 'foreign';
     }
   }
-  // O histórico é um hardlink: mesmo arquivo físico que o da base.
+  // Arquivos são hardlinks: mesmo arquivo físico que o da base.
   if (!item.dir) {
     const hub = lstat(src);
     if (hub && st.ino === hub.ino && st.dev === hub.dev) return 'shared';
@@ -48,10 +62,10 @@ function itemStatus(acc, item) {
   return 'local';
 }
 
-// 'base' (a própria ~/.claude) | 'shared' | 'isolated' | 'partial'
-function status(acc) {
+// 'base' (a própria ~/.claude) | 'shared' | 'isolated' | 'partial', para um grupo.
+function status(acc, group = 'history') {
   if (acc.isDefault) return 'base';
-  const states = ITEMS.map((item) => itemStatus(acc, item));
+  const states = GROUPS[group].map((item) => itemStatus(acc, item));
   if (states.every((s) => s === 'shared')) return 'shared';
   if (states.some((s) => s === 'shared')) return 'partial';
   return 'isolated';
@@ -106,6 +120,31 @@ function mergeHistory(from, to) {
   if (missing.length) fs.appendFileSync(to, missing.join('\n') + '\n');
 }
 
+// Arquivo de configuração divergente: vence o modificado por último. O conteúdo vencedor é gravado
+// na base no lugar (preserva os hardlinks das outras contas) e o perdedor vai para um backup.
+function mergeConfigFile(local, hub, item, tag) {
+  if (sameContent(local, hub)) return;
+  const backupDir = path.join(store.STORE_DIR, 'backups', `${tag}-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+  fs.mkdirSync(backupDir, { recursive: true });
+  const localNewer = fs.statSync(local).mtimeMs > fs.statSync(hub).mtimeMs;
+  if (localNewer) {
+    fs.copyFileSync(hub, path.join(backupDir, `${item.name}.base`));
+    writeInPlace(hub, fs.readFileSync(local));
+  } else {
+    fs.copyFileSync(local, path.join(backupDir, `${item.name}.${tag}`));
+  }
+}
+
+function writeInPlace(file, content) {
+  const fd = fs.openSync(file, 'r+');
+  try {
+    fs.ftruncateSync(fd, 0);
+    fs.writeSync(fd, content, 0, content.length, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function link(src, dst, item) {
   if (item.dir) {
     // Junction no Windows não exige admin/modo desenvolvedor; nos demais SOs vira symlink comum.
@@ -121,46 +160,49 @@ function link(src, dst, item) {
   }
 }
 
-function ensureHubItem(item) {
+// Garante o item na base. Se só a conta tem o arquivo, ele é movido para a base.
+function ensureHubItem(item, localPath) {
   const src = path.join(HUB, item.name);
   if (item.dir) fs.mkdirSync(src, { recursive: true });
-  else {
+  else if (!fs.existsSync(src)) {
     fs.mkdirSync(HUB, { recursive: true });
-    fs.closeSync(fs.openSync(src, 'a'));
+    if (localPath && lstat(localPath) && !lstat(localPath).isSymbolicLink()) move(localPath, src);
+    else fs.writeFileSync(src, item.initial ?? '', { flag: 'a' });
   }
   return src;
 }
 
 // Liga a conta à base, levando para a base o que já existia localmente. Retorna os itens alterados.
-function share(acc) {
-  if (acc.isDefault) throw new Error(`A conta "${acc.name}" já é a base do histórico compartilhado.`);
+function share(acc, { groups = ['history'] } = {}) {
+  if (acc.isDefault) throw new Error(`A conta "${acc.name}" já é a base dos dados compartilhados.`);
   fs.mkdirSync(acc.dir, { recursive: true });
   const changed = [];
-  for (const item of ITEMS) {
-    const st = itemStatus(acc, item);
-    if (st === 'shared') continue;
-    const src = ensureHubItem(item);
+  for (const item of itemsOf(groups)) {
     const dst = path.join(acc.dir, item.name);
+    if (itemStatus(acc, item) === 'shared') continue;
+    const src = ensureHubItem(item, dst);
+    const st = itemStatus(acc, item); // pode ter mudado: o arquivo local pode ter virado a base
     if (st === 'foreign') fs.rmSync(dst);
     if (st === 'local') {
       if (item.dir) {
         mergeDir(dst, src, acc.name);
         fs.rmSync(dst, { recursive: true, force: true });
       } else {
-        mergeHistory(dst, src);
+        if (item.kind === 'log') mergeHistory(dst, src);
+        else mergeConfigFile(dst, src, item, acc.name);
         fs.rmSync(dst);
       }
     }
-    link(src, dst, item);
+    if (!lstat(dst)) link(src, dst, item);
     changed.push(item.name);
   }
   return changed;
 }
 
 // Desfaz os links. Com copy, a conta fica com uma cópia do histórico atual; sem, começa vazia.
-function unshare(acc, { copy = false } = {}) {
+function unshare(acc, { copy = false, groups = GROUP_NAMES } = {}) {
   const changed = [];
-  for (const item of ITEMS) {
+  for (const item of itemsOf(groups)) {
     if (itemStatus(acc, item) !== 'shared') continue;
     const dst = path.join(acc.dir, item.name);
     const src = path.join(HUB, item.name);
@@ -174,4 +216,4 @@ function unshare(acc, { copy = false } = {}) {
   return changed;
 }
 
-module.exports = { HUB, ITEMS, itemStatus, status, share, unshare };
+module.exports = { HUB, GROUPS, GROUP_NAMES, ITEMS, itemStatus, status, share, unshare };
