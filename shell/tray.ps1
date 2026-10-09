@@ -98,12 +98,26 @@ function Get-Level($acc) {
     if ($max -ge 90) { 'red' } elseif ($max -ge 70) { 'yellow' } else { 'green' }
 }
 
-function Get-Summary($acc) {
+# Tempo até o reset da janela, como no "csw usage": 45min, 3h20, 2d.
+function Get-ResetIn($acc, [string]$key) {
+    $w = @($acc.usage.windows) | Where-Object { $_ -and $_.key -eq $key } | Select-Object -First 1
+    if (-not $w -or -not $w.resetsAt) { return $null }
+    $mins = [int][math]::Round((([datetime]$w.resetsAt).ToUniversalTime() - [datetime]::UtcNow).TotalMinutes)
+    if ($mins -lt 60) { '{0}min' -f [math]::Max($mins, 0) }
+    elseif ($mins -lt 48 * 60) { '{0}h{1:00}' -f [math]::Floor($mins / 60), ($mins % 60) }
+    else { '{0}d' -f [math]::Round($mins / 1440) }
+}
+
+function Get-Summary($acc, [switch]$WithReset) {
     if ($acc.usage.status) { return ($acc.usage.status -replace '\s*\(.*\)$', '') }
     $parts = @()
-    $five = Get-Pct $acc 'five_hour'; $week = Get-Pct $acc 'seven_day'
-    if ($null -ne $five) { $parts += "5h $five%" }
-    if ($null -ne $week) { $parts += "semana $week%" }
+    foreach ($p in @(@('five_hour', '5h'), @('seven_day', 'semana'))) {
+        $pct = Get-Pct $acc $p[0]
+        if ($null -eq $pct) { continue }
+        $text = "$($p[1]) $pct%"
+        if ($WithReset) { $in = Get-ResetIn $acc $p[0]; if ($in) { $text += " ($in)" } }
+        $parts += $text
+    }
     if ($parts.Count) { $parts -join ' · ' } else { 'sem dados' }
 }
 
@@ -131,6 +145,8 @@ $script:alerted = @{}
 $script:menuDirty = $false
 $script:balloonTarget = $null
 $script:actionJob = $null
+$script:updating = $null
+$noteFile = Join-Path $storeDir 'update-note.json'
 
 # Clicar na notificação de limite troca para a conta sugerida.
 $notify.add_BalloonTipClicked({
@@ -150,7 +166,6 @@ $notify.add_MouseUp({
 function Show-Error([string]$msg) {
     Write-Log "erro: $msg"
     $script:balloonTarget = $null
-$script:actionJob = $null
     $notify.ShowBalloonTip(5000, 'claude-switch', $msg, [System.Windows.Forms.ToolTipIcon]::Error)
 }
 
@@ -158,7 +173,6 @@ function Switch-Account([string]$name) {
     try {
         Invoke-CoreSync @('use', $name) | Out-Null
         $script:balloonTarget = $null
-$script:actionJob = $null
         $notify.ShowBalloonTip(3000, 'claude-switch', "Conta global: $name (vale para novos terminais)", [System.Windows.Forms.ToolTipIcon]::Info)
     } catch { Show-Error $_.Exception.Message }
     $script:lastRun = [datetime]::MinValue
@@ -168,6 +182,37 @@ $script:actionJob = $null
 function Start-TokenRefresh {
     if ($script:actionJob) { return }
     $script:actionJob = Start-Core @('refresh')
+    $script:menuDirty = $true
+}
+
+# Atualiza o app num processo à parte: o "csw update" reinicia este ícone quando há versão nova,
+# então o resultado volta por um arquivo de recado que o ícone (este ou o novo) mostra.
+function Start-AppUpdate {
+    if ($script:updating) { return }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Node
+        $psi.Arguments = ((@($Core, 'update', '--notify', '--interval', "$Interval", '--threshold', "$Threshold")) | ForEach-Object { '"' + $_ + '"' }) -join ' '
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        [void][System.Diagnostics.Process]::Start($psi)
+        $script:updating = Get-Date
+    } catch { Show-Error $_.Exception.Message }
+    $script:menuDirty = $true
+}
+
+function Show-UpdateNote {
+    if (-not (Test-Path $noteFile)) { return }
+    try {
+        $note = Get-Content $noteFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        Remove-Item $noteFile -Force
+    } catch { return }
+    $script:updating = $null
+    $script:balloonTarget = $null
+    $icon = if ($note.ok) { [System.Windows.Forms.ToolTipIcon]::Info } else { [System.Windows.Forms.ToolTipIcon]::Warning }
+    $body = [string]$note.body
+    if ($body.Length -gt 250) { $body = $body.Substring(0, 247) + '…' }
+    $notify.ShowBalloonTip(10000, [string]$note.title, $body, $icon)
     $script:menuDirty = $true
 }
 
@@ -225,13 +270,13 @@ function Build-Menu {
         $best = if ($st.best -and $st.best -ne $st.global) { @($st.accounts | Where-Object { $_.name -eq $st.best }) | Select-Object -First 1 }
         if ($best) {
             $bi = Add-Item $menu ("Trocar para a de mais limite: {0}" -f $best.name) { Switch-Account $this.Tag.name } $best
-            $bi.ShortcutKeyDisplayString = Get-Summary $best
+            $bi.ShortcutKeyDisplayString = Get-Summary $best -WithReset
             $bi.Font = New-Object System.Drawing.Font($bi.Font, [System.Drawing.FontStyle]::Bold)
         }
         [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
         foreach ($acc in $st.accounts) {
             $item = Add-Item $menu $acc.name { Switch-Account $this.Tag.name } $acc
-            $item.ShortcutKeyDisplayString = Get-Summary $acc
+            $item.ShortcutKeyDisplayString = Get-Summary $acc -WithReset
             $item.Checked = [bool]$acc.isGlobal
             $item.ToolTipText = (@($acc.email, $acc.plan, "histórico: $($acc.history)", "config: $($acc.config)") | Where-Object { $_ }) -join ' · '
         }
@@ -244,6 +289,8 @@ function Build-Menu {
     $refreshText = if ($script:actionJob) { 'Renovando tokens…' } elseif ($expired) { "Renovar tokens expirados ($expired)" } else { 'Renovar tokens expirados (nenhum)' }
     $ri = Add-Item $menu $refreshText { Start-TokenRefresh }
     $ri.Enabled = [bool]$expired -and -not $script:actionJob
+    $ui = Add-Item $menu $(if ($script:updating) { 'Atualizando o claude-switch…' } else { 'Atualizar o claude-switch' }) { Start-AppUpdate }
+    $ui.Enabled = -not $script:updating
     [void](Add-Item $menu 'Atualizar uso agora' { $script:forceFull = $true; $script:lastRun = [datetime]::MinValue })
     $auto = Add-Item $menu 'Iniciar com o Windows' {
         try { Invoke-CoreSync @('tray', 'autostart', $(if ($this.Checked) { 'off' } else { 'on' }), '--interval', "$Interval", '--threshold', "$Threshold") | Out-Null }
@@ -283,7 +330,6 @@ function Update-Tray {
                     $body = "Clique para trocar para $($best.name) ($(Get-Summary $best))"
                 } else {
                     $script:balloonTarget = $null
-$script:actionJob = $null
                     $body = 'Nenhuma outra conta com limite disponível' + (Format-Reset $g $w.key)
                 }
                 $notify.ShowBalloonTip(15000, $title, $body, [System.Windows.Forms.ToolTipIcon]::Warning)
@@ -301,6 +347,8 @@ $timer.add_Tick({
         try {
             if ($stopEvent.WaitOne(0)) { Exit-Tray; return }
             if ($script:actionJob -and $script:actionJob.Process.HasExited) { Complete-TokenRefresh }
+            Show-UpdateNote
+            if ($script:updating -and ((Get-Date) - $script:updating).TotalMinutes -ge 2) { $script:updating = $null; $script:menuDirty = $true }
             if ($script:menuDirty -and -not $menu.Visible) { $script:menuDirty = $false; Build-Menu }
             if ($script:job) {
                 if (-not $script:job.Process.HasExited) { return }

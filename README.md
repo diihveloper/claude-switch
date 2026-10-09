@@ -53,10 +53,19 @@ csw help
 >
 > **macOS com bash:** o bash de login lê o `~/.bash_profile`. Se ele não carregar o `~/.bashrc`, adicione `source ~/.bashrc` a ele.
 
-### Atualizar e desinstalar
+### Atualizar
 
 ```bash
-git -C ~/.claude-switch-app pull      # atualizar
+csw update
+```
+
+Ou, no ícone da bandeja, clique em **Atualizar o claude-switch**. O `update` baixa a versão nova (`git pull` na pasta do app), mostra o que mudou e reinicia o ícone da bandeja, se ele estiver rodando. Se a função `csw` dos shells mudar, ele avisa para abrir um novo terminal.
+
+> **Instalações anteriores ao `csw update`:** atualize uma vez à mão com `git -C ~/.claude-switch-app pull` (no PowerShell: `git -C "$HOME\.claude-switch-app" pull`) e reinicie o ícone com `csw tray stop` e `csw tray start`. Daqui em diante, basta o `csw update`.
+
+### Desinstalar
+
+```bash
 csw uninstall                         # remove os blocos dos profiles
 rm -rf ~/.claude-switch-app           # remove o app (suas contas em ~/.claude-accounts continuam)
 ```
@@ -80,6 +89,7 @@ csw path empresa
 csw usage                     # limites da conta atual (como o /usage)
 csw usage --all               # limites de todas as contas
 csw doctor                    # diagnóstico; --fix corrige o que der
+csw update                    # atualiza o claude-switch
 ```
 
 ```text
@@ -170,11 +180,12 @@ O ícone mostra o **% da janela de 5h** da conta global e muda de cor pelo maior
 Ao passar o mouse, aparecem a conta e o uso. O menu (clique esquerdo ou direito) permite:
 
 - **trocar para a conta com mais limite** (aparece quando há uma melhor que a global);
-- ver o uso de cada conta;
+- ver o uso de cada conta e quanto falta para o reset de cada janela, por exemplo `5h 66% (1h20) · semana 18% (6d)`;
 - **trocar a conta global** com um clique;
 - **abrir o Claude** com qualquer conta num terminal novo;
 - forçar a atualização do uso;
-- ligar ou desligar a inicialização junto com o sistema.
+- ligar ou desligar a inicialização junto com o sistema;
+- **atualizar o claude-switch** (o resultado aparece numa notificação).
 
 Quando uma janela de uso da conta global passa do limite (`--threshold`), aparece uma notificação que sugere a conta com mais limite:
 

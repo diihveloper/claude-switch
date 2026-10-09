@@ -15,6 +15,7 @@ const install = require('../src/install');
 const statusline = require('../src/statusline');
 const doctor = require('../src/doctor');
 const refresh = require('../src/refresh');
+const update = require('../src/update');
 const { c, table, bar, info } = require('../src/format');
 
 const VALUE_FLAGS = new Set(['dir', 'emit', 'interval', 'max-age', 'threshold']);
@@ -430,6 +431,34 @@ async function cmdDoctor(flags) {
   if (results.some((r) => r.level === 'error') && !flags.fix) process.exitCode = 1;
 }
 
+// Atualiza o app (git pull) e reinicia o ícone. --notify: deixa o resultado para o ícone mostrar.
+function cmdUpdate(flags) {
+  const opts = {};
+  if (flags.interval) opts.interval = Math.max(1, Number(flags.interval) || 5);
+  if (flags.threshold) opts.threshold = Math.min(100, Math.max(1, Number(flags.threshold) || 90));
+  let r;
+  try {
+    r = update.run(opts);
+  } catch (err) {
+    if (flags.notify) update.writeNote({ ok: false, title: 'Falha ao atualizar o claude-switch', body: err.message });
+    throw err;
+  }
+  const ver = (v) => (v.version ? `v${v.version} (${v.commit})` : v.commit);
+  if (!r.updated) {
+    console.log(`${c.green('✔')} Já está na versão mais recente ${c.dim(ver(r.from))}.`);
+    if (flags.notify) update.writeNote({ ok: true, title: 'claude-switch', body: `Já está na versão mais recente: ${ver(r.from)}.` });
+    return;
+  }
+  console.log(`${c.green('✔')} Atualizado: ${ver(r.from)} → ${ver(r.to)}`);
+  for (const msg of r.commits) console.log(c.dim(`  • ${msg}`));
+  if (r.trayRestarted) console.log(`${c.green('✔')} Ícone da bandeja reiniciado.`);
+  if (r.shellChanged) console.log(c.yellow('! Abra um novo terminal para carregar a nova função "csw".'));
+  if (flags.notify) {
+    const list = r.commits.slice(0, 4).map((m) => `• ${m}`).join('\n') + (r.commits.length > 4 ? `\n• e mais ${r.commits.length - 4}` : '');
+    update.writeNote({ ok: true, title: `claude-switch atualizado para ${ver(r.to)}`, body: list });
+  }
+}
+
 // ---------------------------------------------------------------- bandeja
 
 function cmdTray(pos, flags) {
@@ -597,6 +626,7 @@ ${c.bold('Uso e visibilidade')}
   ${c.cyan('tray autostart')} on|off          inicia o ícone junto com o sistema
 
 ${c.bold('Manutenção')}
+  ${c.cyan('update')}                          atualiza o claude-switch (git pull) e reinicia o ícone
   ${c.cyan('doctor')} [--fix]                  diagnóstico (tokens, links, função csw, profiles)
   ${c.cyan('install')} / ${c.cyan('uninstall')}             instala/remove a função "csw" (PowerShell, bash, zsh)
 
@@ -656,6 +686,9 @@ async function main() {
       return cmdTray(pos, flags);
     case 'usage':
       return cmdUsage(pos, flags);
+    case 'update':
+    case 'upgrade':
+      return cmdUpdate(flags);
     case 'install':
       return cmdInstall();
     case 'uninstall':

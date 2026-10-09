@@ -136,11 +136,26 @@ function level(acc) {
   return max >= 90 ? 'red' : max >= 70 ? 'yellow' : 'green';
 }
 
-function summary(acc) {
+// Tempo até o reset da janela, como no "csw usage": 45min, 3h20, 2d.
+function resetIn(acc, key) {
+  const d = acc?.usage?.windows?.find((x) => x.key === key)?.resetsAt;
+  if (!d || isNaN(new Date(d))) return null;
+  const mins = Math.round((new Date(d) - Date.now()) / 60000);
+  if (mins < 60) return `${Math.max(mins, 0)}min`;
+  if (mins < 48 * 60) return `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}`;
+  return `${Math.round(mins / 1440)}d`;
+}
+
+function summary(acc, { withReset = false } = {}) {
   if (acc.usage?.status) return acc.usage.status.replace(/\s*\(.*\)$/, '');
-  const five = pctOf(acc, 'five_hour');
-  const week = pctOf(acc, 'seven_day');
-  return [five != null && `5h ${five}%`, week != null && `semana ${week}%`].filter(Boolean).join(' · ') || 'sem dados';
+  const parts = [];
+  for (const [key, label] of [['five_hour', '5h'], ['seven_day', 'semana']]) {
+    const pct = pctOf(acc, key);
+    if (pct == null) continue;
+    const reset = withReset && resetIn(acc, key);
+    parts.push(`${label} ${pct}%${reset ? ` (${reset})` : ''}`);
+  }
+  return parts.join(' · ') || 'sem dados';
 }
 
 // yad interpreta "!" e "|" como separadores do menu.
@@ -165,6 +180,19 @@ function notifySwitch(title, body, target, node, core) {
   });
 }
 
+// Mostra (uma vez) o resultado do "csw update --notify" disparado pelo menu.
+function showUpdateNote() {
+  const file = path.join(store.STORE_DIR, 'update-note.json');
+  let note;
+  try {
+    note = JSON.parse(fs.readFileSync(file, 'utf8'));
+    fs.rmSync(file, { force: true });
+  } catch {
+    return;
+  }
+  if (hasNotifySend()) spawn('notify-send', ['-a', 'claude-switch', String(note.title), String(note.body)], { stdio: 'ignore' });
+}
+
 function runLinuxForeground({ interval, threshold }) {
   if (!hasYad()) throw new Error('Instale o "yad" para usar o ícone na bandeja (ex.: sudo apt install yad).');
   if (runningPid() && runningPid() !== process.pid) throw new Error('O ícone já está rodando.');
@@ -186,6 +214,7 @@ function runLinuxForeground({ interval, threshold }) {
   async function refresh() {
     if (busy) return;
     busy = true;
+    showUpdateNote();
     try {
       const st = await status.collect({ maxAge: forceFull ? 0 : interval * 60 });
       forceFull = false;
@@ -203,7 +232,7 @@ function runLinuxForeground({ interval, threshold }) {
         notifySwitch(`Claude · ${g.name}: ${w.label} em ${Math.round(w.pct)}%`, body, best?.name, process.execPath, CORE);
       }
 
-      const items = st.accounts.map((a) => `${a.isGlobal ? '● ' : '○ '}${yadSafe(a.name)} — ${yadSafe(summary(a))}!${node} ${core} use ${a.name}`);
+      const items = st.accounts.map((a) => `${a.isGlobal ? '● ' : '○ '}${yadSafe(a.name)} — ${yadSafe(summary(a, { withReset: true }))}!${node} ${core} use ${a.name}`);
       if (best) items.unshift(`Trocar para a de mais limite: ${yadSafe(best.name)}!${node} ${core} use ${best.name}`);
       if (terminal) {
         for (const a of st.accounts) {
@@ -219,6 +248,8 @@ function runLinuxForeground({ interval, threshold }) {
         const script = `out=$(NO_COLOR=1 ${node} ${core} refresh 2>&1)${notify}; kill -USR1 ${process.pid}`;
         items.push(`Renovar tokens expirados (${expired})!sh -c ${shq(script)}`);
       }
+      // O "update" reinicia este processo quando há versão nova; o resultado volta pelo arquivo de recado.
+      items.push(`Atualizar o claude-switch!${node} ${core} update --notify --interval ${interval} --threshold ${threshold}`);
       items.push(`Atualizar uso agora!kill -USR1 ${process.pid}`);
       items.push(`Sair!kill ${process.pid}`);
       send(`menu:${items.join('|')}`);
