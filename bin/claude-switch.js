@@ -16,7 +16,9 @@ const statusline = require('../src/statusline');
 const doctor = require('../src/doctor');
 const refresh = require('../src/refresh');
 const update = require('../src/update');
-const { c, table, bar, info } = require('../src/format');
+const history = require('../src/history');
+const chart = require('../src/chart');
+const { c, table, bar, info, stripAnsi } = require('../src/format');
 
 const VALUE_FLAGS = new Set(['dir', 'emit', 'interval', 'max-age', 'threshold']);
 
@@ -515,6 +517,7 @@ async function cmdUsage(pos, flags) {
     targets = cur ? [cur] : accounts.all();
   }
   const results = await Promise.all(targets.map((acc) => usage.fetchUsage(acc)));
+  const now = Date.now();
   targets.forEach((acc, i) => {
     const d = accounts.details(acc);
     const meta = [d.email, d.plan].filter(Boolean).join(' · ');
@@ -524,9 +527,24 @@ async function cmdUsage(pos, flags) {
       console.log(`  ${c.yellow(r.status)}`);
     } else {
       const wins = usage.windows(r.data);
+      const entry = { fetchedAt: now, status: null, windows: wins.map((w) => ({ key: w.key, pct: w.pct, resetsAt: w.resetsAt })) };
+      history.record(acc.name, entry);
+      const fc = history.forecastAll(acc.name, entry, undefined, now);
       if (!wins.length) console.log(c.dim('  nenhum limite informado'));
       const rows = wins.map((w) => ['  ' + w.label, bar(w.pct), `${Math.round(w.pct)}%`.padStart(4), fmtReset(w.resetsAt)]);
-      if (rows.length) console.log(table(rows));
+      // A previsão vai numa linha abaixo da janela, alinhada com a coluna do reset.
+      if (rows.length) {
+        table(rows).split('\n').forEach((line, j) => {
+          console.log(line);
+          const f = fc[wins[j].key];
+          const text = history.longText(f, now);
+          if (!text) return;
+          const indent = stripAnsi(line).length - stripAnsi(rows[j][3]).length;
+          const color = f.state === 'ok' ? c.dim : f.state === 'out' ? c.red : c.yellow;
+          console.log(' '.repeat(rows[j][3] ? indent : 4) + color(text));
+        });
+      }
+      if (flags.history) printHistory(acc, wins, now);
       const extra = r.data.extra_usage;
       if (extra && extra.is_enabled && typeof extra.used_credits === 'number') {
         const limit = typeof extra.monthly_limit === 'number' ? ` / ${(extra.monthly_limit / 100).toFixed(2)}` : '';
@@ -535,6 +553,57 @@ async function cmdUsage(pos, flags) {
     }
     if (i < targets.length - 1) console.log();
   });
+  if (flags.history && targets.length > 1) printFreeCapacity(targets, now);
+}
+
+const chartWidth = () => Math.max(24, Math.min(72, (process.stdout.columns || 80) - 10));
+const fmtChartTime = (t) =>
+  new Date(t).toLocaleString('pt-BR', { weekday: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+// Gráfico de cada janela: 5h nas últimas 24h, semanal nos últimos 7 dias.
+function printHistory(acc, wins, now) {
+  const spans = { five_hour: 24 * history.HOUR, seven_day: 7 * 24 * history.HOUR };
+  const all = history.samples(acc.name, now - spans.seven_day, { all: true });
+  if (all.length < 2) {
+    console.log(c.dim('  gráfico: ainda sem histórico (é gravado a cada consulta; com o ícone da bandeja, a cada 5 min)'));
+    return;
+  }
+  for (const w of wins) {
+    const span = spans[w.key];
+    if (!span) continue;
+    const from = now - span;
+    const points = all.filter((s) => s[w.key] && s.t >= from).map((s) => ({ t: s.t, v: s[w.key][0] }));
+    if (points.length < 2) continue;
+    console.log();
+    console.log(`  ${w.label} ${c.dim(`· ${span > 24 * history.HOUR ? 'últimos 7 dias' : 'últimas 24h'}`)}`);
+    const cols = chart.bucketize(points, from, now, chartWidth(), span > 24 * history.HOUR ? 2 : 3);
+    console.log(chart.render(cols, { from, to: now, fmtTime: fmtChartTime, color: chart.usageColor }));
+  }
+}
+
+// Visão global: soma do limite livre (100% − maior uso entre 5h e semanal) de todas as contas.
+function printFreeCapacity(targets, now) {
+  const span = 24 * history.HOUR;
+  const from = now - span;
+  const width = chartWidth();
+  const samples = history.samples(null, from - history.HOUR, { all: true });
+  const perAcc = targets.map((acc) => {
+    const points = samples
+      .filter((s) => s.a === acc.name)
+      .map((s) => ({ t: s.t, v: 100 - Math.max(s.five_hour?.[0] ?? 0, s.seven_day?.[0] ?? 0) }));
+    return chart.bucketize(points, from, now, width, 6);
+  });
+  // Uma coluna só entra quando há dado de todas as contas, para não parecer queda de limite.
+  const cols = perAcc[0].map((_, i) => (perAcc.every((a) => a[i] != null) ? perAcc.reduce((s, a) => s + a[i], 0) : null));
+  const filled = cols.filter((v) => v != null);
+  if (!filled.length) return;
+  const max = targets.length * 100;
+  console.log();
+  console.log(`${c.bold('Todas as contas')} ${c.dim('· limite livre somado, últimas 24h')}`);
+  console.log(`  agora: ${(filled[filled.length - 1] / 100).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} de ${targets.length} contas livres`);
+  if (filled.length < 2) return;
+  const color = (v) => (v < 0.1 * max ? c.red : v < 0.3 * max ? c.yellow : c.green);
+  console.log(chart.render(cols, { max, top: `${targets.length}`, bottom: '0', from, to: now, fmtTime: fmtChartTime, color }));
 }
 
 function cmdRun(argv) {
@@ -617,7 +686,8 @@ ${c.bold('Compartilhamento')} (com a conta "${store.DEFAULT_NAME}")
   ${c.cyan('unshare')} <conta|--all> [--history] [--config] [--copy]
 
 ${c.bold('Uso e visibilidade')}
-  ${c.cyan('usage')} [conta|--all]             uso/limites (como o /usage)
+  ${c.cyan('usage')} [conta|--all] [--history] uso/limites (como o /usage), previsão de quando acaba
+                                  e, com --history, gráficos do uso (e do limite livre somado)
   ${c.cyan('refresh')} [conta] [--force]        renova tokens expirados (sem precisar abrir o Claude)
   ${c.cyan('statusline')} install|uninstall    conta e uso na barra de status do Claude Code
   ${c.cyan('prompt')} on|off|status            conta e uso no prompt do terminal

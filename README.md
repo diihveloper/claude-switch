@@ -88,6 +88,7 @@ csw remove empresa            # pede confirmação; -y pula; --keep-files manté
 csw path empresa
 csw usage                     # limites da conta atual (como o /usage)
 csw usage --all               # limites de todas as contas
+csw usage --history           # + gráficos do uso (com --all, também o limite livre somado)
 csw doctor                    # diagnóstico; --fix corrige o que der
 csw update                    # atualiza o claude-switch
 ```
@@ -97,6 +98,27 @@ $ csw usage
 default voce@exemplo.com · max
   Sessão (5h)  ██░░░░░░░░░░░░░░░░░░   10%  reseta em 1h21 (seg., 05/10, 19:29)
   Semanal      ██████████████░░░░░░   68%  reseta em 8h51 (ter., 06/10, 02:59)
+                                           no ritmo atual acaba ~23:10 (3h49 antes do reset)
+```
+
+### Previsão e histórico de uso
+
+Cada consulta de uso (ícone da bandeja, statusline, `csw usage`) grava uma amostra em `~/.claude-switch/usage-history.jsonl`, que guarda cerca de 35 dias. Com o ícone da bandeja ligado, isso acontece a cada 5 min. A API só informa o valor atual, então o histórico começa a partir da primeira consulta.
+
+A partir do histórico, o `csw usage` prevê, no ritmo atual, se o limite acaba antes do reset:
+
+- **Janela de 5h:** usa o ritmo dos últimos 60 min. Sem amostras suficientes, usa a média desde o início da janela.
+- **Janela semanal:** usa a média desde o início da semana, para não oscilar entre dia e noite. Só aparece depois de 12 h de janela.
+
+O `csw usage --history` desenha, no terminal, o uso da janela de 5h nas últimas 24 h e o da semanal nos últimos 7 dias. Com `--all`, mostra também o **limite livre somado** de todas as contas nas últimas 24 h (por exemplo, "1,4 de 3 contas livres").
+
+```text
+  Sessão (5h) · últimas 24h
+  100% │▃▅           ▁▃▅                                       █
+       │██       ▂▄▅▇███                                   ▁▃▄▅█
+       │██   ▂▃▅████████                               ▂▃▄▆█████
+    0% │██▂▅▇███████████▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃▅▇█████████
+        qui., 08, 13:15                                    agora
 ```
 
 A conta **`default`** é o `~/.claude` original. Ao selecioná-la, a variável `CLAUDE_CONFIG_DIR` é **removida**, em vez de apontar para `~/.claude`. Assim o Claude continua usando o `~/.claude.json` da home, como antes.
@@ -181,6 +203,7 @@ Ao passar o mouse, aparecem a conta e o uso. O menu (clique esquerdo ou direito)
 
 - **trocar para a conta com mais limite** (aparece quando há uma melhor que a global);
 - ver o uso de cada conta e quanto falta para o reset de cada janela, por exemplo `5h 66% (1h20) · semana 18% (6d)`;
+- ver a **previsão** da conta global, por exemplo `Previsão: 5h acaba ~16:40 · semana ok (~72% no reset)` (a de cada conta aparece ao passar o mouse sobre ela);
 - **trocar a conta global** com um clique;
 - **abrir o Claude** com qualquer conta num terminal novo;
 - forçar a atualização do uso;

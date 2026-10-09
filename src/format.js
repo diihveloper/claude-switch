@@ -40,4 +40,4 @@ function bar(pct, width = 20) {
 // Mensagens para o usuário vão sempre para stderr; stdout fica livre para o código de shell do wrapper.
 const info = (...a) => console.error(...a);
 
-module.exports = { c, table, bar, info };
+module.exports = { c, table, bar, info, stripAnsi };

@@ -267,6 +267,9 @@ function Build-Menu {
     } else {
         $title = Add-Item $menu ('Conta global: ' + $(if ($st.global) { $st.global } else { '(pasta não registrada)' })) $null
         $title.Enabled = $false
+        # Previsão de quando o limite da conta global acaba (no ritmo atual).
+        $gAcc = @($st.accounts | Where-Object { $_.isGlobal }) | Select-Object -First 1
+        if ($gAcc -and $gAcc.forecast.text) { (Add-Item $menu ('Previsão: ' + $gAcc.forecast.text) $null).Enabled = $false }
         $best = if ($st.best -and $st.best -ne $st.global) { @($st.accounts | Where-Object { $_.name -eq $st.best }) | Select-Object -First 1 }
         if ($best) {
             $bi = Add-Item $menu ("Trocar para a de mais limite: {0}" -f $best.name) { Switch-Account $this.Tag.name } $best
@@ -278,7 +281,7 @@ function Build-Menu {
             $item = Add-Item $menu $acc.name { Switch-Account $this.Tag.name } $acc
             $item.ShortcutKeyDisplayString = Get-Summary $acc -WithReset
             $item.Checked = [bool]$acc.isGlobal
-            $item.ToolTipText = (@($acc.email, $acc.plan, "histórico: $($acc.history)", "config: $($acc.config)") | Where-Object { $_ }) -join ' · '
+            $item.ToolTipText = (@($acc.forecast.text, ((@($acc.email, $acc.plan, "histórico: $($acc.history)", "config: $($acc.config)") | Where-Object { $_ }) -join ' · ')) | Where-Object { $_ }) -join "`n"
         }
         [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
         $open = New-Object System.Windows.Forms.ToolStripMenuItem 'Abrir Claude com'
@@ -316,6 +319,12 @@ function Update-Tray {
         $notify.Icon = New-StatusIcon $text $colors[(Get-Level $g)]
         if ($old) { $old.Dispose() }
         $tip = "Claude · $($g.name)`n" + (Get-Summary $g) + (Format-Reset $g 'five_hour')
+        # O tooltip do Windows corta em 63 caracteres: a previsão só entra se couber.
+        $fc5 = $g.forecast.windows.five_hour
+        if ($fc5 -and $fc5.state -eq 'runsOut') {
+            $withFc = "Claude · $($g.name)`n" + (Get-Summary $g) + ' · acaba ~' + [DateTimeOffset]::FromUnixTimeMilliseconds([long]$fc5.eta).LocalDateTime.ToString('HH:mm')
+            if ($withFc.Length -le 63) { $tip = $withFc }
+        }
         $notify.Text = if ($tip.Length -gt 63) { $tip.Substring(0, 63) } else { $tip }
 
         # Aviso único por janela de uso ao cruzar o limite, sugerindo a conta com mais limite.

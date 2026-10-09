@@ -8,6 +8,7 @@ const env = require('./env');
 const accounts = require('./accounts');
 const usage = require('./usage');
 const share = require('./share');
+const history = require('./history');
 
 const CACHE_FILE = path.join(store.STORE_DIR, 'usage-cache.json');
 const PROMPT_FILE = path.join(store.STORE_DIR, 'prompt.tsv');
@@ -75,6 +76,13 @@ function writePromptCache(cache = readCache()) {
   }
 }
 
+// Previsão por janela, com o texto curto pronto para a bandeja ("5h acaba ~16:40 · semana ok ...").
+function forecastSummary(name, entry, recent, now) {
+  const all = history.forecastAll(name, entry, recent, now);
+  const texts = Object.entries(all).map(([k, f]) => history.shortText(k, f, now));
+  return { windows: all, text: texts.join(' · ') || null };
+}
+
 // maxAge (segundos): reaproveita o uso consultado há menos tempo que isso; 0 = sempre consulta.
 async function collect({ maxAge = 0 } = {}) {
   const list = accounts.all();
@@ -97,6 +105,7 @@ async function collect({ maxAge = 0 } = {}) {
           : [],
       };
       cache[acc.name] = entry;
+      history.record(acc.name, entry);
       dirty = true;
       return entry;
     })
@@ -104,6 +113,7 @@ async function collect({ maxAge = 0 } = {}) {
   if (dirty) writeCache(cache);
   writePromptCache(cache);
 
+  const recent = history.samples(null, now - 2 * history.HOUR);
   const result = list.map((acc, i) => ({
     name: acc.name,
     dir: acc.dir,
@@ -114,6 +124,7 @@ async function collect({ maxAge = 0 } = {}) {
     config: share.status(acc, 'config'),
     available: available(usages[i]),
     usage: usages[i],
+    forecast: forecastSummary(acc.name, usages[i], recent, usages[i]?.fetchedAt || now),
   }));
   const ranked = result.filter((a) => a.available != null).sort((a, b) => b.available - a.available || b.isGlobal - a.isGlobal);
   return { global: globalAcc ? globalAcc.name : null, globalRaw, best: ranked[0]?.name || null, accounts: result };

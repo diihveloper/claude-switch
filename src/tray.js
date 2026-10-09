@@ -220,7 +220,8 @@ function runLinuxForeground({ interval, threshold }) {
       forceFull = false;
       const g = st.accounts.find((a) => a.isGlobal) || st.accounts[0];
       send(`icon:${icons[level(g)]}`);
-      send(`tooltip:${yadSafe(`Claude · ${g.name}`)}\\n${yadSafe(summary(g))}`);
+      const fc = g.forecast?.text ? `\\nPrevisão: ${yadSafe(g.forecast.text)}` : '';
+      send(`tooltip:${yadSafe(`Claude · ${g.name}`)}\\n${yadSafe(summary(g))}${fc}`);
       const best = st.best && st.best !== g.name ? st.accounts.find((a) => a.name === st.best) : null;
 
       // Aviso único por janela de uso ao cruzar o limite, oferecendo a conta com mais limite.
