@@ -14,6 +14,16 @@ const STALE_SECONDS = 300;
 const ansi = (code, s) => (process.env.NO_COLOR ? s : `\x1b[${code}m${s}\x1b[0m`);
 const COLOR = { green: '32', yellow: '33', red: '31', gray: '90' };
 
+const hhmm = (t) => new Date(t).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const ddmm = (t) => new Date(t).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+
+// "2d 5h", ou "5h30" quando falta menos de um dia.
+function daysHours(msLeft) {
+  const mins = Math.max(0, Math.round(msLeft / 60000));
+  if (mins < 1440) return `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, '0')}`;
+  return `${Math.floor(mins / 1440)}d ${Math.floor((mins % 1440) / 60)}h`;
+}
+
 function render() {
   const raw = env.getSession();
   const acc = accounts.byEnvValue(raw);
@@ -29,9 +39,9 @@ function render() {
       if (!w) continue;
       const pct = Math.round(w.pct);
       const color = pct >= 90 ? COLOR.red : pct >= 70 ? COLOR.yellow : COLOR.green;
-      const reset = key === 'five_hour' && w.resetsAt
-        ? ansi('90', ` ↻${new Date(w.resetsAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`)
-        : '';
+      let reset = '';
+      if (w.resetsAt && key === 'five_hour') reset = ansi('90', ` ↻${hhmm(w.resetsAt)}`);
+      else if (w.resetsAt) reset = ansi('90', ` ↻${daysHours(new Date(w.resetsAt) - Date.now())} (${ddmm(w.resetsAt)} ${hhmm(w.resetsAt)})`);
       parts.push(`${label} ${ansi(color, pct + '%')}${reset}`);
     }
   } else parts.push(ansi('90', 'carregando uso…'));

@@ -177,7 +177,7 @@ csw statusline install        # conta e uso na barra de status do Claude Code
 csw prompt on                 # [claude:trabalho 13%] no prompt do PowerShell, bash e zsh
 ```
 
-- **Statusline:** mostra `◆ trabalho · 5h 13% ↻19:29 · semana 69%`, com as cores do nível de uso. O `install` grava `statusLine` no `settings.json` de cada conta (uma vez só, se as configurações forem compartilhadas). Se já existir outra statusline, ela não é substituída sem `--force`. Para remover: `csw statusline uninstall`.
+- **Statusline:** mostra `◆ trabalho · 5h 13% ↻19:29 · semana 69% ↻2d 9h (30/10 19:59)`, com as cores do nível de uso. O `install` grava `statusLine` no `settings.json` de cada conta (uma vez só, se as configurações forem compartilhadas). Se já existir outra statusline, ela não é substituída sem `--force`. Para remover: `csw statusline uninstall`.
 - **Prompt:** lê um arquivo de cache, sem chamar o Node a cada comando. O % aparece quando o dado tem menos de 1h.
 - **Atualização do uso:** a statusline atualiza o cache de uso em segundo plano, no máximo uma vez por minuto, e o ícone da bandeja também mantém o cache em dia.
 
