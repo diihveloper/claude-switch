@@ -210,7 +210,7 @@ function runLinuxForeground({ interval, threshold }) {
 
   let busy = false;
   let forceFull = true;
-  const alerted = new Set();
+  const alerted = new Map();
   async function refresh() {
     if (busy) return;
     busy = true;
@@ -224,11 +224,16 @@ function runLinuxForeground({ interval, threshold }) {
       send(`tooltip:${yadSafe(`Claude · ${g.name}`)}\\n${yadSafe(summary(g))}${fc}`);
       const best = st.best && st.best !== g.name ? st.accounts.find((a) => a.name === st.best) : null;
 
-      // Aviso único por janela de uso ao cruzar o limite, oferecendo a conta com mais limite.
+      // Avisa só duas vezes por janela de uso: ao cruzar o limite e ao esgotar, oferecendo a conta com mais limite.
       for (const w of g.usage?.windows || []) {
-        const key = `${g.name}/${w.key}/${w.resetsAt}`;
-        if (w.pct < threshold || alerted.has(key)) continue;
-        alerted.add(key);
+        const key = `${g.name}/${w.key}`;
+        const reset = w.resetsAt ? Date.parse(w.resetsAt) : 0;
+        let prev = alerted.get(key);
+        // O resets_at da API oscila alguns segundos entre leituras: só é janela nova se mudar mais de 10 min.
+        if (!prev || Math.abs(reset - prev.reset) > 10 * 60 * 1000) alerted.set(key, (prev = { reset, level: 0 }));
+        const lvl = w.pct >= 100 ? 2 : w.pct >= threshold ? 1 : 0;
+        if (lvl <= prev.level) continue;
+        prev.level = lvl;
         const body = best ? `Conta com mais limite: ${best.name} (${summary(best)})` : 'Nenhuma outra conta com limite disponível.';
         notifySwitch(`Claude · ${g.name}: ${w.label} em ${Math.round(w.pct)}%`, body, best?.name, process.execPath, CORE);
       }

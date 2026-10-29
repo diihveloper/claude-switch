@@ -327,12 +327,20 @@ function Update-Tray {
         }
         $notify.Text = if ($tip.Length -gt 63) { $tip.Substring(0, 63) } else { $tip }
 
-        # Aviso único por janela de uso ao cruzar o limite, sugerindo a conta com mais limite.
+        # Avisa só duas vezes por janela de uso: ao cruzar o limite e ao esgotar, sugerindo a conta com mais limite.
         $best = if ($st.best -and $st.best -ne $g.name) { @($st.accounts | Where-Object { $_.name -eq $st.best }) | Select-Object -First 1 }
         foreach ($w in @($g.usage.windows | Where-Object { $_ })) {
-            $key = "$($g.name)/$($w.key)/$($w.resetsAt)"
-            if ($w.pct -ge $Threshold -and -not $script:alerted[$key]) {
-                $script:alerted[$key] = $true
+            $key = "$($g.name)/$($w.key)"
+            $reset = if ($w.resetsAt) { ([datetime]$w.resetsAt).ToUniversalTime() } else { [datetime]::MinValue }
+            $prev = $script:alerted[$key]
+            # O resets_at da API oscila alguns segundos entre leituras: só é janela nova se mudar mais de 10 min.
+            if (-not $prev -or [math]::Abs(($reset - $prev.reset).TotalMinutes) -gt 10) {
+                $prev = @{ reset = $reset; level = 0 }
+                $script:alerted[$key] = $prev
+            }
+            $lvl = if ($w.pct -ge 100) { 2 } elseif ($w.pct -ge $Threshold) { 1 } else { 0 }
+            if ($lvl -gt $prev.level) {
+                $prev.level = $lvl
                 $title = "Claude · $($g.name): {0} em {1}%" -f $w.label, [math]::Round($w.pct)
                 if ($best) {
                     $script:balloonTarget = $best.name
